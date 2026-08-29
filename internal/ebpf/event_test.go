@@ -54,7 +54,7 @@ func TestEventLayoutMatchesBTF(t *testing.T) {
 			continue
 		}
 		seen[m.Name] = true
-		if got := uint32(m.Offset.Bytes()); got != want {
+		if got := m.Offset.Bytes(); got != want {
 			t.Errorf("field %s at offset %d in BTF, Go decoder assumes %d", m.Name, got, want)
 		}
 	}

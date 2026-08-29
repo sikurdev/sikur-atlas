@@ -13,7 +13,7 @@ import (
 	"github.com/sikurdev/sikur-atlas/internal/graph"
 )
 
-func testServer(t *testing.T, ui bool) (*Server, *graph.Store, *httptest.Server) {
+func testServer(t *testing.T, ui bool) (*graph.Store, *httptest.Server) {
 	t.Helper()
 	store := graph.NewStore()
 	var uiFS fstest.MapFS
@@ -35,7 +35,7 @@ func testServer(t *testing.T, ui bool) (*Server, *graph.Store, *httptest.Server)
 	s.debounce = 10 * time.Millisecond
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
-	return s, store, srv
+	return store, srv
 }
 
 func seed(store *graph.Store) {
@@ -47,7 +47,7 @@ func seed(store *graph.Store) {
 }
 
 func TestGraphEndpoint(t *testing.T) {
-	_, store, srv := testServer(t, false)
+	store, srv := testServer(t, false)
 	seed(store)
 
 	resp, err := http.Get(srv.URL + "/api/graph")
@@ -74,7 +74,7 @@ func TestGraphEndpoint(t *testing.T) {
 }
 
 func TestMetaEndpoint(t *testing.T) {
-	_, _, srv := testServer(t, false)
+	_, srv := testServer(t, false)
 
 	resp, err := http.Get(srv.URL + "/api/meta")
 	if err != nil {
@@ -91,7 +91,7 @@ func TestMetaEndpoint(t *testing.T) {
 }
 
 func TestStreamSendsSnapshotThenUpdates(t *testing.T) {
-	_, store, srv := testServer(t, false)
+	store, srv := testServer(t, false)
 	seed(store)
 
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -148,7 +148,7 @@ func waitSnap(t *testing.T, ch chan graph.Snapshot, what string) graph.Snapshot 
 }
 
 func TestUIServedWithSPAFallback(t *testing.T) {
-	_, _, srv := testServer(t, true)
+	_, srv := testServer(t, true)
 
 	for _, path := range []string{"/", "/some/client/route"} {
 		resp, err := http.Get(srv.URL + path)
@@ -174,7 +174,7 @@ func TestUIServedWithSPAFallback(t *testing.T) {
 }
 
 func TestUIMissingIsExplicit(t *testing.T) {
-	_, _, srv := testServer(t, false)
+	_, srv := testServer(t, false)
 	resp, err := http.Get(srv.URL + "/")
 	if err != nil {
 		t.Fatal(err)

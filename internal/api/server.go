@@ -15,13 +15,13 @@ import (
 
 // Meta describes the running agent for /api/meta.
 type Meta struct {
-	Version          string      `json:"version"`
-	StartedAt        time.Time   `json:"startedAt"`
-	Kernel           string      `json:"kernel,omitempty"`
-	Collector        any         `json:"collector"`
-	KernelDrops      uint64      `json:"kernelDrops"`
-	DecodeErrors     uint64      `json:"decodeErrors"`
-	DockerEnrichment bool        `json:"dockerEnrichment"`
+	Version          string    `json:"version"`
+	StartedAt        time.Time `json:"startedAt"`
+	Kernel           string    `json:"kernel,omitempty"`
+	Collector        any       `json:"collector"`
+	KernelDrops      uint64    `json:"kernelDrops"`
+	DecodeErrors     uint64    `json:"decodeErrors"`
+	DockerEnrichment bool      `json:"dockerEnrichment"`
 }
 
 // Server wires the HTTP API. UI may be nil when no web assets are built.
@@ -117,15 +117,13 @@ func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Atlas web UI not built — run `make web` and rebuild the agent.", http.StatusNotFound)
 		return
 	}
-	f, err := s.ui.Open(pathFor(r.URL.Path))
-	if err != nil {
+	if _, err := fs.Stat(s.ui, pathFor(r.URL.Path)); err != nil {
 		// SPA fallback: unknown paths get index.html.
 		r2 := *r
 		r2.URL.Path = "/"
 		http.ServeFileFS(w, &r2, s.ui, "index.html")
 		return
 	}
-	f.Close()
 	http.ServeFileFS(w, r, s.ui, pathFor(r.URL.Path))
 }
 

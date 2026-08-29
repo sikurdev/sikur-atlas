@@ -5,6 +5,14 @@ linters:
     - misspell
     - unconvert
     - unparam
+  settings:
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (net/http.ResponseWriter).Write
+        - (*github.com/cilium/ebpf/ringbuf.Reader).Close
+        - (github.com/cilium/ebpf/link.Link).Close
 
 formatters:
   enable:

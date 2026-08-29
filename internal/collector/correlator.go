@@ -151,8 +151,8 @@ func WithIdleTTL(d time.Duration) Option {
 
 func New(store *graph.Store, resolver ProcessResolver, opts ...Option) *Correlator {
 	c := &Correlator{
-		store:    store,
-		resolver: resolver,
+		store:          store,
+		resolver:       resolver,
 		grace:          time.Second,
 		idleTTL:        time.Hour,
 		socks:          make(map[uint64]*sockState),

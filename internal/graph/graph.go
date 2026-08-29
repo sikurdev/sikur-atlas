@@ -25,13 +25,13 @@ const (
 // NodeSpec is the identity a caller provides when reporting an
 // observation. The store merges specs into persistent nodes.
 type NodeSpec struct {
-	ID            string
-	Kind          NodeKind
-	Label         string
-	Exe           string
-	ContainerID   string
-	PID           uint32 // 0 = not applicable
-	Addr          string // observed address for this endpoint, "" if unknown
+	ID          string
+	Kind        NodeKind
+	Label       string
+	Exe         string
+	ContainerID string
+	PID         uint32 // 0 = not applicable
+	Addr        string // observed address for this endpoint, "" if unknown
 }
 
 // Node is a service in the graph.
