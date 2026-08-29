@@ -150,12 +150,12 @@ int atlas_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 		/* connect() runs in the owning process context. */
 		set_current_task(e);
 	} else if (type == ATLAS_EV_CLOSE) {
-		/* Lifetime counters from tcp_sock, tcplife-style. bytes_acked
-		 * includes SYN/FIN sequence space, so subtract the SYN. */
+		/* Lifetime data-octet counters (RFC 4898) from tcp_sock: unlike
+		 * bytes_acked, these never count SYN/FIN sequence space.
+		 * bytes_sent includes retransmitted octets. */
 		struct tcp_sock *tp = (struct tcp_sock *)ctx->skaddr;
-		__u64 acked = BPF_CORE_READ(tp, bytes_acked);
 
-		e->bytes_sent = acked > 0 ? acked - 1 : 0;
+		e->bytes_sent = BPF_CORE_READ(tp, bytes_sent);
 		e->bytes_recv = BPF_CORE_READ(tp, bytes_received);
 	}
 

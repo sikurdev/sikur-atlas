@@ -223,8 +223,8 @@ func TestClientCloseBeforeAccept(t *testing.T) {
 	}
 }
 
-// Containerized processes become container nodes and fire the enrichment
-// hook exactly once per container.
+// Containerized processes become container nodes and fire the
+// enrichment hook (dedup is the enricher's job).
 func TestContainerAttribution(t *testing.T) {
 	cid := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	res := fakeResolver{
@@ -259,8 +259,13 @@ func TestContainerAttribution(t *testing.T) {
 	if node.ID != "container:0123456789ab" || node.ContainerID != cid {
 		t.Fatalf("unexpected container node %+v", node)
 	}
-	if len(hooked) != 1 || hooked[0] != cid {
-		t.Fatalf("hook fired %v, want once with %s", hooked, cid)
+	if len(hooked) == 0 {
+		t.Fatal("container hook never fired")
+	}
+	for _, h := range hooked {
+		if h != cid {
+			t.Fatalf("hook fired with wrong id %q", h)
+		}
 	}
 
 	e := snap.Edges[0]
@@ -320,5 +325,94 @@ func TestIdleSweep(t *testing.T) {
 	st := c.Stats()
 	if st.LiveSockets != 0 {
 		t.Fatalf("stale socket survived sweep: %+v", st)
+	}
+}
+
+// A connection outliving the idle TTL produces no events while alive;
+// aging it out must release the edge's active count instead of leaving
+// it stuck forever, and its eventual close must be a no-op.
+func TestIdleSweepReleasesActiveCount(t *testing.T) {
+	res := fakeResolver{100: {PID: 100, Comm: "curl", Exe: "/usr/bin/curl"}}
+	store := graph.NewStore()
+	c := New(store, res, WithGracePeriod(time.Second), WithIdleTTL(time.Minute))
+
+	cli := ap("10.0.0.5", 52000)
+	srv := ap("93.184.216.34", 443)
+	c.HandleEvent(ev(model.EventOpen, 1, 100, "curl", netip.AddrPort{}, srv, 0))
+	c.HandleEvent(ev(model.EventEstablished, 1, 0, "", cli, srv, 1))
+	c.Tick(base.Add(2 * time.Second)) // materializes
+
+	if e := store.Snapshot().Edges[0]; e.ActiveConns != 1 {
+		t.Fatalf("active = %d, want 1", e.ActiveConns)
+	}
+
+	c.Tick(base.Add(2 * time.Minute)) // TTL expiry
+
+	e := store.Snapshot().Edges[0]
+	if e.ActiveConns != 0 {
+		t.Fatalf("active = %d after sweep, want 0", e.ActiveConns)
+	}
+	if c.Stats().LiveRecords != 0 {
+		t.Fatalf("record survived sweep: %+v", c.Stats())
+	}
+
+	// The real close arrives much later; it must not corrupt anything.
+	closeEv := ev(model.EventClose, 1, 0, "", cli, srv, 180_000)
+	closeEv.BytesSent = 999
+	c.HandleEvent(closeEv)
+	e = store.Snapshot().Edges[0]
+	if e.ActiveConns != 0 || e.BytesSent != 0 {
+		t.Fatalf("late close corrupted edge: %+v", e)
+	}
+}
+
+// The kernel can reuse a socket address after a close event was lost to
+// ring buffer overflow. The new connection must not inherit the old
+// tuple key: its bytes belong to its own edge.
+func TestSockAddressReuseAfterLostClose(t *testing.T) {
+	res := fakeResolver{100: {PID: 100, Comm: "curl", Exe: "/usr/bin/curl"}}
+	c, store := newTestCorrelator(res)
+
+	oldSrv := ap("10.1.1.1", 443)
+	c.HandleEvent(ev(model.EventOpen, 1, 100, "curl", netip.AddrPort{}, oldSrv, 0))
+	c.HandleEvent(ev(model.EventEstablished, 1, 0, "", ap("10.0.0.5", 52000), oldSrv, 1))
+	c.Tick(base.Add(2 * time.Second))
+	oldEdge := store.Snapshot().Edges[0]
+
+	// CLOSE for sock 1 is lost; the kernel reuses the address for a new
+	// connection to a different server.
+	newSrv := ap("10.2.2.2", 9090)
+	newCli := ap("10.0.0.5", 52001)
+	c.HandleEvent(ev(model.EventOpen, 1, 100, "curl", netip.AddrPort{}, newSrv, 5000))
+	c.HandleEvent(ev(model.EventEstablished, 1, 0, "", newCli, newSrv, 5001))
+
+	closeEv := ev(model.EventClose, 1, 0, "", newCli, newSrv, 6000)
+	closeEv.BytesSent, closeEv.BytesRecv = 700, 70
+	c.HandleEvent(closeEv)
+
+	snap := store.Snapshot()
+	for _, e := range snap.Edges {
+		switch e.ID {
+		case oldEdge.ID:
+			if e.BytesSent != 0 || e.BytesRecv != 0 {
+				t.Fatalf("bytes misattributed to stale edge: %+v", e)
+			}
+		default:
+			if e.DstPort == 9090 && (e.BytesSent != 700 || e.BytesRecv != 70) {
+				t.Fatalf("new edge bytes wrong: %+v", e)
+			}
+		}
+	}
+	var found bool
+	for _, e := range snap.Edges {
+		if e.DstPort == 9090 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("new connection's edge missing: %+v", snap.Edges)
+	}
+	if c.Stats().LiveRecords != 0 || c.Stats().LiveSockets != 0 {
+		t.Fatalf("state leaked: %+v", c.Stats())
 	}
 }

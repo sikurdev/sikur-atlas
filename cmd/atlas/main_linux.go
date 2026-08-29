@@ -154,23 +154,41 @@ func run(listen, dockerSocket string, scanInterval time.Duration) error {
 		log.Printf("atlas %s serving on http://%s", version, listen)
 		serveErr <- srv.ListenAndServe()
 	}()
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- tracer.Run(ctx, corr.HandleEvent, func(error) {
+			decodeErrors.Add(1)
+		})
+	}()
 
-	runErr := tracer.Run(ctx, corr.HandleEvent, func(error) {
-		decodeErrors.Add(1)
-	})
-
+	// Whichever side fails first (e.g. the listen address is taken)
+	// takes the whole agent down loudly instead of leaving it headless.
+	var firstErr error
 	select {
 	case err := <-serveErr:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
+		firstErr = filterErr(err)
+		stop()
+		<-runErr
+	case err := <-runErr:
+		firstErr = filterErr(err)
+		stop()
+		if err := filterErr(<-serveErr); firstErr == nil {
+			firstErr = err
 		}
-	default:
 	}
-	if runErr != nil && !errors.Is(runErr, context.Canceled) {
-		return runErr
+	if firstErr != nil {
+		return firstErr
 	}
 	log.Printf("shut down cleanly")
 	return nil
+}
+
+// filterErr drops the errors that just mean "orderly shutdown".
+func filterErr(err error) error {
+	if err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }
 
 func kernelVersion() string {

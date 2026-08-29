@@ -68,8 +68,17 @@ func NewTracer() (*Tracer, error) {
 	}
 	t.links = append(t.links, tp)
 
+	// Raise maxactive: with the default, a burst of parallel accept()
+	// returns exhausts kretprobe instances and silently drops server
+	// attribution. Not every attach mechanism supports the option, so
+	// fall back to the default rather than failing.
 	kp, err := link.Kretprobe("inet_csk_accept",
-		coll.Programs["atlas_inet_csk_accept_ret"], nil)
+		coll.Programs["atlas_inet_csk_accept_ret"],
+		&link.KprobeOptions{RetprobeMaxActive: 128})
+	if err != nil {
+		kp, err = link.Kretprobe("inet_csk_accept",
+			coll.Programs["atlas_inet_csk_accept_ret"], nil)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("attaching kretprobe inet_csk_accept: %w", err)
 	}

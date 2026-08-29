@@ -118,14 +118,14 @@ type Correlator struct {
 	resolver ProcessResolver
 	grace    time.Duration
 	idleTTL  time.Duration
-	// onContainer fires (outside any hot path guarantees, but under mu)
-	// the first time a container id is seen, for async name enrichment.
+	// onContainer fires for every containerized observation; the
+	// receiver must deduplicate and never block. Set once at
+	// construction (read without the lock by ObserveListen).
 	onContainer func(containerID string)
 
-	socks          map[uint64]*sockState
-	records        map[connKey]*connRecord
-	seenContainers map[string]struct{}
-	stats          Stats
+	socks   map[uint64]*sockState
+	records map[connKey]*connRecord
+	stats   Stats
 }
 
 // Option configures a Correlator.
@@ -137,8 +137,8 @@ func WithGracePeriod(d time.Duration) Option {
 	return func(c *Correlator) { c.grace = d }
 }
 
-// WithContainerHook registers a callback fired once per newly seen
-// container id.
+// WithContainerHook registers a callback fired for every containerized
+// observation. The receiver must deduplicate and must not block.
 func WithContainerHook(fn func(containerID string)) Option {
 	return func(c *Correlator) { c.onContainer = fn }
 }
@@ -151,13 +151,12 @@ func WithIdleTTL(d time.Duration) Option {
 
 func New(store *graph.Store, resolver ProcessResolver, opts ...Option) *Correlator {
 	c := &Correlator{
-		store:          store,
-		resolver:       resolver,
-		grace:          time.Second,
-		idleTTL:        time.Hour,
-		socks:          make(map[uint64]*sockState),
-		records:        make(map[connKey]*connRecord),
-		seenContainers: make(map[string]struct{}),
+		store:    store,
+		resolver: resolver,
+		grace:    time.Second,
+		idleTTL:  time.Hour,
+		socks:    make(map[uint64]*sockState),
+		records:  make(map[connKey]*connRecord),
 	}
 	for _, o := range opts {
 		o(c)
@@ -343,7 +342,7 @@ func (c *Correlator) Tick(now time.Time) {
 			}
 		}
 		if c.idleTTL > 0 && now.Sub(rec.lastTouch) > c.idleTTL {
-			delete(c.records, key)
+			c.dropRecord(key, rec, now)
 		}
 	}
 	if c.idleTTL > 0 {
@@ -357,12 +356,21 @@ func (c *Correlator) Tick(now time.Time) {
 	c.stats.LiveRecords = len(c.records)
 }
 
-// ObserveListen reports a listening socket discovered by the procfs
-// scanner.
-func (c *Correlator) ObserveListen(pid uint32, comm string, addr netip.Addr, port uint16, at time.Time) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// dropRecord removes tracking state for a record, releasing the edge's
+// active-connection count if the record materialized but never observed
+// a close (lost close event, or a connection outliving the idle TTL).
+func (c *Correlator) dropRecord(key connKey, rec *connRecord, at time.Time) {
+	if rec.materialized && !rec.closed {
+		c.store.ConnectionClosed(rec.edgeID, 0, 0, at, false)
+		rec.closed = true
+	}
+	delete(c.records, key)
+}
 
+// ObserveListen reports a listening socket discovered by the procfs
+// scanner. It deliberately takes no correlator lock: resolution may hit
+// the live /proc, and the graph store synchronizes itself.
+func (c *Correlator) ObserveListen(pid uint32, comm string, addr netip.Addr, port uint16, at time.Time) {
 	info := c.resolver.Resolve(pid, comm)
 	spec := c.specForProcess(info, addrString(addr))
 	c.store.ObserveListen(spec, port, at)
@@ -386,6 +394,18 @@ func (c *Correlator) sock(id uint64, at time.Time) *sockState {
 }
 
 func (c *Correlator) attachSock(st *sockState, key connKey, at time.Time) *connRecord {
+	if st.hasKey && st.key != key {
+		// The kernel reused a socket address whose close event we lost.
+		// Detach from the stale record before adopting the new identity,
+		// releasing its edge bookkeeping.
+		if old, ok := c.records[st.key]; ok {
+			old.sockRefs--
+			if old.sockRefs <= 0 {
+				c.dropRecord(st.key, old, at)
+			}
+		}
+		st.hasKey = false
+	}
 	rec, ok := c.records[key]
 	if !ok {
 		rec = &connRecord{key: key, lastTouch: at}
@@ -470,11 +490,11 @@ func (c *Correlator) specForProcess(info model.ProcessInfo, addr string) graph.N
 		if len(short) > 12 {
 			short = short[:12]
 		}
-		if _, seen := c.seenContainers[info.ContainerID]; !seen {
-			c.seenContainers[info.ContainerID] = struct{}{}
-			if c.onContainer != nil {
-				c.onContainer(info.ContainerID)
-			}
+		// Fired for every containerized observation on purpose: the
+		// enricher deduplicates, and re-enqueueing is what retries a
+		// lookup that failed transiently (traffic-driven retry).
+		if c.onContainer != nil {
+			c.onContainer(info.ContainerID)
 		}
 		return graph.NodeSpec{
 			ID:          "container:" + short,

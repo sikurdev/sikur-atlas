@@ -33,11 +33,11 @@ setup). Three transitions matter:
   establishment.
 - `→ ESTABLISHED`: handshake done. Fires in softirq context, so no pid —
   but it carries the full 4-tuple and the socket identity.
-- `→ CLOSE`: the socket's lifetime byte counters
-  (`tcp_sock.bytes_acked`/`bytes_received`, the tcplife approach) are
-  read here via CO-RE and shipped with the event. `bytes_acked` includes
-  SYN/FIN sequence space; Atlas subtracts the SYN and accepts ±1 around
-  teardown.
+- `→ CLOSE`: the socket's lifetime data-octet counters
+  (`tcp_sock.bytes_sent`/`bytes_received`, RFC 4898, kernel ≥ 4.19) are
+  read here via CO-RE and shipped with the event. Unlike `bytes_acked`
+  they never count SYN/FIN sequence space; `bytes_sent` does include
+  retransmitted octets.
 
 **`kretprobe:inet_csk_accept`** — `accept()` returning in the server
 process. The only place server-side pid/comm attribution is truthful.
@@ -126,7 +126,12 @@ truth.
   they close (no state transition to observe). A `/proc/net` seed scan
   at startup is the obvious v0.2 fix and slots into the collector
   without schema changes.
-- Stale tracking state from lost close events is swept hourly.
+- Tracking state is capped by a 1-hour idle TTL. An established
+  connection produces no events while it lives, so a connection
+  outliving the TTL ages out: its edge's active count is released, and
+  bytes from its eventual close are not attributed. The same path
+  reclaims state after a lost close event, and socket-address reuse
+  after a lost close re-keys instead of misattributing.
 
 ## Seams for later
 

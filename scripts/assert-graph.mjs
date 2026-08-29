@@ -46,15 +46,42 @@ for (const [srcName, dstName, port] of expectedEdges) {
   if (!(edge.connections >= 1)) {
     failures.push(`edge has no connections: ${srcName} -> ${dstName}:${port}`);
   }
+  if (edge.activeConns < 0 || edge.activeConns > edge.connections) {
+    failures.push(
+      `activeConns out of range on ${srcName} -> ${dstName}:${port}: ` +
+        `${edge.activeConns} of ${edge.connections}`,
+    );
+  }
   if (edge.bytesSent > 0 || edge.bytesRecv > 0) edgesWithBytes++;
+  // HTTP responses are larger than requests, so the client->server edge
+  // must have received more than it sent; catches swapped orientation.
+  if (srcName === "atlas-demo-loadgen" && edge.bytesSent > 0 &&
+      edge.bytesRecv <= edge.bytesSent) {
+    failures.push(
+      `byte direction suspicious on ${srcName} -> ${dstName}: ` +
+        `sent=${edge.bytesSent} recv=${edge.bytesRecv}`,
+    );
+  }
   found.push(
     `${srcName} -> ${dstName}:${port}  conns=${edge.connections} ` +
       `active=${edge.activeConns} bytes=${edge.bytesSent}/${edge.bytesRecv}`,
   );
 }
 
-if (edgesWithBytes === 0 && failures.length === 0) {
-  failures.push("no expected edge accumulated byte counters");
+// The demo closes connections constantly; nearly every edge must have
+// accumulated bytes (>=5 of 6 leaves slack for one racing in-flight).
+if (edgesWithBytes < 5 && failures.length === 0) {
+  failures.push(`only ${edgesWithBytes} of 6 expected edges have byte counters`);
+}
+
+if (meta.kernelDrops > 0) {
+  failures.push(`ring buffer dropped ${meta.kernelDrops} events`);
+}
+if (meta.decodeErrors > 0) {
+  failures.push(`${meta.decodeErrors} events failed to decode`);
+}
+if (!(meta.collector?.events > 100)) {
+  failures.push(`suspiciously few events: ${meta.collector?.events}`);
 }
 
 console.log("== agent meta ==");

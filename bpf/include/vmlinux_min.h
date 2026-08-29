@@ -135,10 +135,11 @@ struct sock {
 	struct sock_common __sk_common;
 } __attribute__((preserve_access_index));
 
-/* include/linux/tcp.h — lifetime byte counters, read at close. */
+/* include/linux/tcp.h — lifetime data-octet counters (RFC 4898), read
+ * at close. Present since kernel 4.19. */
 struct tcp_sock {
 	__u64 bytes_received;
-	__u64 bytes_acked;
+	__u64 bytes_sent;
 } __attribute__((preserve_access_index));
 
 #endif /* __VMLINUX_MIN_H__ */

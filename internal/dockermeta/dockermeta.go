@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -72,14 +73,18 @@ func (c *Client) Inspect(ctx context.Context, containerID string) (Meta, error) 
 }
 
 // Enricher resolves container ids in the background and applies results
-// through the supplied callback. Failed lookups are retried on the next
-// Enqueue of the same id after the retry interval.
+// through the supplied callback. Callers enqueue an id on every
+// observation; the enricher deduplicates, so a lookup that failed
+// transiently is retried by the next observation after the retry
+// interval (traffic-driven retry).
 type Enricher struct {
 	client *Client
 	apply  func(containerID string, meta Meta)
 	queue  chan string
-	done   map[string]time.Time
 	retry  time.Duration
+
+	mu   sync.Mutex
+	done map[string]time.Time // zero time = resolved for good
 }
 
 func NewEnricher(client *Client, apply func(containerID string, meta Meta)) *Enricher {
@@ -92,12 +97,24 @@ func NewEnricher(client *Client, apply func(containerID string, meta Meta)) *Enr
 	}
 }
 
-// Enqueue schedules a container id for resolution; never blocks.
+// Enqueue schedules a container id for resolution; never blocks. Ids
+// that are already resolved, or failed too recently, are dropped here so
+// hot paths don't churn the queue.
 func (e *Enricher) Enqueue(containerID string) {
+	if e.settled(containerID) {
+		return
+	}
 	select {
 	case e.queue <- containerID:
-	default: // queue full: drop, a later connection will retry
+	default: // queue full: drop, a later observation will retry
 	}
+}
+
+func (e *Enricher) settled(cid string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	t, ok := e.done[cid]
+	return ok && (t.IsZero() || time.Since(t) < e.retry)
 }
 
 // Run processes the queue until ctx is done. Call from one goroutine.
@@ -107,18 +124,22 @@ func (e *Enricher) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case cid := <-e.queue:
-			if t, ok := e.done[cid]; ok && (t.IsZero() || time.Since(t) < e.retry) {
-				continue // zero time = resolved for good
+			if e.settled(cid) {
+				continue
 			}
 			reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			meta, err := e.client.Inspect(reqCtx, cid)
 			cancel()
+			e.mu.Lock()
 			if err != nil {
-				e.done[cid] = time.Now() // retry window
-				continue
+				e.done[cid] = time.Now() // opens a retry window
+			} else {
+				e.done[cid] = time.Time{}
 			}
-			e.done[cid] = time.Time{}
-			e.apply(cid, meta)
+			e.mu.Unlock()
+			if err == nil {
+				e.apply(cid, meta)
+			}
 		}
 	}
 }
