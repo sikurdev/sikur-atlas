@@ -29,12 +29,12 @@ import (
 	"github.com/sikurdev/sikur-atlas/internal/graph"
 	"github.com/sikurdev/sikur-atlas/internal/history"
 	"github.com/sikurdev/sikur-atlas/internal/procfs"
+	"github.com/sikurdev/sikur-atlas/internal/resources"
+	"github.com/sikurdev/sikur-atlas/internal/unixdiag"
 	"github.com/sikurdev/sikur-atlas/internal/webui"
 )
 
-var version = "0.2.0" // overridden via -ldflags at release build
-
-func main() {
+func agentMain() {
 	listen := flag.String("listen", "127.0.0.1:7171", "HTTP listen address for API and UI")
 	dockerSocket := flag.String("docker-socket", dockermeta.DefaultSocket, "Docker socket for container name enrichment (\"\" disables)")
 	scanInterval := flag.Duration("scan-interval", 30*time.Second, "listening-socket rescan interval")
@@ -124,14 +124,21 @@ func run(listen, dockerSocket, dbPath string, scanInterval time.Duration) error 
 	}()
 	go func() {
 		scan := func() {
-			raw := procfs.ScanListeners()
-			listeners := make([]collector.Listener, len(raw))
-			for i, l := range raw {
+			res := procfs.ScanSockets()
+			listeners := make([]collector.Listener, len(res.Listeners))
+			for i, l := range res.Listeners {
 				listeners[i] = collector.Listener{
 					PID: l.PID, Comm: l.Comm, Addr: l.Addr, Port: l.Port,
 				}
 			}
 			corr.SyncListeners(listeners, time.Now())
+			// AF_UNIX topology: exact peer pairing from the kernel's
+			// own socket table.
+			if socks, err := unixdiag.Dump(); err == nil {
+				corr.SyncUnixTopology(socks, res.InodeToPID, time.Now())
+			} else {
+				log.Printf("unix diag: %v", err)
+			}
 		}
 		scan()
 		t := time.NewTicker(scanInterval)
@@ -146,6 +153,10 @@ func run(listen, dockerSocket, dbPath string, scanInterval time.Duration) error 
 		}
 	}()
 
+	// Resource sampling: one bounded pass per history bucket.
+	sampler := resources.NewSampler(store, hist)
+	go sampler.Run(ctx.Done(), 10*time.Second)
+
 	var decodeErrors atomic.Uint64
 	startedAt := time.Now().UTC()
 	metaFn := func() api.Meta {
@@ -159,6 +170,7 @@ func run(listen, dockerSocket, dbPath string, scanInterval time.Duration) error 
 			DecodeErrors:     decodeErrors.Load(),
 			DockerEnrichment: enricher != nil,
 			History:          true,
+			HostPSI:          sampler.HostPressure(),
 		}
 	}
 

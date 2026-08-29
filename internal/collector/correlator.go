@@ -37,6 +37,15 @@ type Recorder interface {
 	EdgeResets(edgeID string, n uint64, at time.Time)
 	EdgeRetrans(edgeID string, n uint64, at time.Time)
 	EdgeRTT(edgeID string, rttUs uint32, at time.Time)
+	// EdgeConnects counts successful connects without touching the
+	// standing-connection gauge (AF_UNIX: connects are exact events,
+	// active pairs are sampled separately).
+	EdgeConnects(edgeID string, n uint64, at time.Time)
+	// EdgeActive adjusts only the standing-connection gauge.
+	EdgeActive(edgeID string, delta int64, at time.Time)
+	// NodeEvent records a lifecycle event (exec/exit/crash/oom) on a
+	// node.
+	NodeEvent(nodeID, kind string, pid uint32, detail string, at time.Time)
 }
 
 type direction int
@@ -126,16 +135,22 @@ type pendingClose struct {
 
 // Stats are exported through /api/meta.
 type Stats struct {
-	Events        uint64 `json:"events"`
-	OpenEvents    uint64 `json:"openEvents"`
-	AcceptEvents  uint64 `json:"acceptEvents"`
-	EstabEvents   uint64 `json:"establishedEvents"`
-	CloseEvents   uint64 `json:"closeEvents"`
-	RetransEvents uint64 `json:"retransEvents"`
-	ResetEvents   uint64 `json:"resetEvents"`
-	FailedConns   uint64 `json:"failedConns"`
-	LiveSockets   int    `json:"liveSockets"`
-	LiveRecords   int    `json:"liveRecords"`
+	Events           uint64 `json:"events"`
+	OpenEvents       uint64 `json:"openEvents"`
+	AcceptEvents     uint64 `json:"acceptEvents"`
+	EstabEvents      uint64 `json:"establishedEvents"`
+	CloseEvents      uint64 `json:"closeEvents"`
+	RetransEvents    uint64 `json:"retransEvents"`
+	ResetEvents      uint64 `json:"resetEvents"`
+	FailedConns      uint64 `json:"failedConns"`
+	UnixConnects     uint64 `json:"unixConnects"`
+	UnixFailures     uint64 `json:"unixFailures"`
+	ExecEvents       uint64 `json:"execEvents"`
+	ExitEvents       uint64 `json:"exitEvents"`
+	OOMEvents        uint64 `json:"oomEvents"`
+	LifecycleDropped uint64 `json:"lifecycleDropped"`
+	LiveSockets      int    `json:"liveSockets"`
+	LiveRecords      int    `json:"liveRecords"`
 }
 
 // Correlator is safe for concurrent use; in practice one goroutine feeds
@@ -156,10 +171,20 @@ type Correlator struct {
 	// addrIndex maps container addresses to node ids so failed connects
 	// towards a local container can name their target. Host/loopback
 	// addresses are deliberately not indexed (they don't identify one
-	// process). Guarded by addrMu: written from the event path, read by
-	// the lock-free ObserveListen path.
-	addrMu    sync.Mutex
-	addrIndex map[netip.Addr]string
+	// process). unixPathIndex maps bound AF_UNIX paths to their owning
+	// node. Both guarded by addrMu: written and read across the event
+	// path and the scan goroutines.
+	addrMu        sync.Mutex
+	addrIndex     map[netip.Addr]string
+	unixPathIndex map[string]string
+
+	// unixPairs tracks standing AF_UNIX pairs between scans; touched
+	// only by SyncUnixTopology's goroutine.
+	unixPairs map[pairKey]string
+
+	// pidNodes remembers which node a pid last belonged to, so exit/oom
+	// events can be attributed after the process is gone. Guarded by mu.
+	pidNodes map[uint32]string
 
 	socks   map[uint64]*sockState
 	records map[connKey]*connRecord
@@ -194,13 +219,16 @@ func WithRecorder(r Recorder) Option {
 
 func New(store *graph.Store, resolver ProcessResolver, opts ...Option) *Correlator {
 	c := &Correlator{
-		store:     store,
-		resolver:  resolver,
-		grace:     time.Second,
-		idleTTL:   time.Hour,
-		addrIndex: make(map[netip.Addr]string),
-		socks:     make(map[uint64]*sockState),
-		records:   make(map[connKey]*connRecord),
+		store:         store,
+		resolver:      resolver,
+		grace:         time.Second,
+		idleTTL:       time.Hour,
+		addrIndex:     make(map[netip.Addr]string),
+		unixPathIndex: make(map[string]string),
+		unixPairs:     make(map[pairKey]string),
+		pidNodes:      make(map[uint32]string),
+		socks:         make(map[uint64]*sockState),
+		records:       make(map[connKey]*connRecord),
 	}
 	for _, o := range opts {
 		o(c)
@@ -233,6 +261,18 @@ func (c *Correlator) HandleEvent(ev model.ConnEvent) {
 	case model.EventReset:
 		c.stats.ResetEvents++
 		c.handleHealthEvent(ev, healthReset)
+	case model.EventUnixConnect:
+		c.stats.UnixConnects++
+		c.handleUnixConnect(ev)
+	case model.EventExec:
+		c.stats.ExecEvents++
+		c.handleLifecycle(ev)
+	case model.EventExit:
+		c.stats.ExitEvents++
+		c.handleLifecycle(ev)
+	case model.EventOOM:
+		c.stats.OOMEvents++
+		c.handleLifecycle(ev)
 	}
 	c.stats.LiveSockets = len(c.socks)
 	c.stats.LiveRecords = len(c.records)
@@ -716,6 +756,14 @@ func otherEnd(key connKey, one netip.AddrPort) netip.AddrPort {
 }
 
 func (c *Correlator) specForProcess(info model.ProcessInfo, addr string) graph.NodeSpec {
+	spec := c.buildSpec(info, addr)
+	// Remember the association for lifecycle attribution after the
+	// process is gone.
+	c.rememberPidNode(info.PID, spec.ID)
+	return spec
+}
+
+func (c *Correlator) buildSpec(info model.ProcessInfo, addr string) graph.NodeSpec {
 	if info.ContainerID != "" {
 		short := info.ContainerID
 		if len(short) > 12 {

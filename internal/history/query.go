@@ -143,7 +143,8 @@ ORDER BY bucket`, presFrom, tU)
 			w.RTTAvgUs = uint32(a.rttSum / a.rttCount)
 		}
 		e := graph.Edge{
-			ID: id, Src: m.Src, Dst: m.Dst, DstPort: m.DstPort, Protocol: m.Protocol,
+			ID: id, Src: m.Src, Dst: m.Dst, DstPort: m.DstPort,
+			Protocol: m.Protocol, Path: m.Path,
 			Connections: w.Opens,
 			ActiveConns: a.lastActive,
 			BytesSent:   w.BytesSent,
@@ -176,34 +177,100 @@ ORDER BY bucket`, presFrom, tU)
 		n.ListenPorts = eraPorts[id]
 		snap.Nodes = append(snap.Nodes, n)
 	}
+
+	if err := s.attachMetrics(&snap, metricFrom, tU, int(metric.Seconds())); err != nil {
+		return graph.Snapshot{}, err
+	}
 	sortSnapshot(&snap)
 	return snap, nil
+}
+
+// attachMetrics decorates reconstructed nodes with their resource
+// window: deltas summed, gauges at their maximum, counts from the
+// latest bucket.
+func (s *Store) attachMetrics(snap *graph.Snapshot, from, to int64, windowSecs int) error {
+	rows, err := s.db.Query(`
+SELECT node_id, bucket, span, cpu_ms, rss_max, io_read, io_write, fds, threads,
+       procs, throttled_us, oom_kills, mem_limit, psi_cpu, psi_mem
+FROM node_metrics
+WHERE bucket + span > ? AND bucket < ?
+ORDER BY bucket`, from, to)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	agg := make(map[string]*graph.NodeMetrics)
+	for rows.Next() {
+		var nodeID string
+		var p MetricPoint
+		var m graph.NodeMetrics
+		var psiCPU, psiMem uint32
+		if err := rows.Scan(&nodeID, &p.Start, &p.Span, &m.CPUMillis, &m.RSSBytes,
+			&m.IOReadBytes, &m.IOWriteBytes, &m.FDs, &m.Threads, &m.Procs,
+			&m.ThrottledUs, &m.OOMKills, &m.MemLimit, &psiCPU, &psiMem); err != nil {
+			return err
+		}
+		a, ok := agg[nodeID]
+		if !ok {
+			a = &graph.NodeMetrics{WindowSecs: windowSecs}
+			agg[nodeID] = a
+		}
+		a.CPUMillis += m.CPUMillis
+		a.IOReadBytes += m.IOReadBytes
+		a.IOWriteBytes += m.IOWriteBytes
+		a.ThrottledUs += m.ThrottledUs
+		a.OOMKills += m.OOMKills
+		if m.RSSBytes > a.RSSBytes {
+			a.RSSBytes = m.RSSBytes
+		}
+		// Rows arrive bucket-ordered: counts and limits track the latest.
+		a.FDs = m.FDs
+		a.Threads = m.Threads
+		a.Procs = m.Procs
+		a.MemLimit = m.MemLimit
+		if pct := float64(psiCPU) / 100; pct > a.PSICpuSomePct {
+			a.PSICpuSomePct = pct
+		}
+		if pct := float64(psiMem) / 100; pct > a.PSIMemSomePct {
+			a.PSIMemSomePct = pct
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := range snap.Nodes {
+		if m, ok := agg[snap.Nodes[i].ID]; ok {
+			snap.Nodes[i].Metrics = m
+		}
+	}
+	return nil
 }
 
 type edgeMetaRow struct {
 	Src, Dst  string
 	DstPort   uint16
 	Protocol  string
+	Path      string
 	FirstSeen time.Time
 	LastSeen  time.Time
 }
 
 func (s *Store) loadMeta() (map[string]edgeMetaRow, map[string]graph.Node, error) {
 	edges := make(map[string]edgeMetaRow)
-	rows, err := s.db.Query(`SELECT id, src, dst, dst_port, protocol, first_seen, last_seen FROM edges`)
+	rows, err := s.db.Query(`SELECT id, src, dst, dst_port, protocol, path, first_seen, last_seen FROM edges`)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var id, src, dst, proto string
+		var id, src, dst, proto, path string
 		var port int
 		var first, last int64
-		if err := rows.Scan(&id, &src, &dst, &port, &proto, &first, &last); err != nil {
+		if err := rows.Scan(&id, &src, &dst, &port, &proto, &path, &first, &last); err != nil {
 			return nil, nil, err
 		}
 		edges[id] = edgeMetaRow{
-			Src: src, Dst: dst, DstPort: uint16(port), Protocol: proto,
+			Src: src, Dst: dst, DstPort: uint16(port), Protocol: proto, Path: path,
 			FirstSeen: time.Unix(first, 0).UTC(), LastSeen: time.Unix(last, 0).UTC(),
 		}
 	}
@@ -247,6 +314,9 @@ type TimelineBucket struct {
 	Closes   uint64 `json:"closes"`
 	Failures uint64 `json:"failures"`
 	Trouble  uint64 `json:"trouble"` // resets + retransmits
+	Execs    uint64 `json:"execs"`
+	Exits    uint64 `json:"exits"` // incl. crashes
+	Ooms     uint64 `json:"ooms"`
 }
 
 // Timeline aggregates activity between from and to into step-sized
@@ -311,6 +381,52 @@ WHERE bucket + span > ? AND bucket <= ?`, fromU, toU)
 				continue
 			}
 			fold(k.start, a.opens, a.closes, a.failures, a.resets+a.retrans)
+		}
+	}
+	s.mu.Unlock()
+
+	// Lifecycle markers per step (persisted + pending).
+	life := func(ts int64, kind string) {
+		start := ts
+		if start < fromU {
+			start = fromU
+		}
+		start = start / stepS * stepS
+		b, ok := out[start]
+		if !ok {
+			b = &TimelineBucket{Start: start}
+			out[start] = b
+		}
+		switch kind {
+		case "exec":
+			b.Execs++
+		case "oom":
+			b.Ooms++
+		default:
+			b.Exits++
+		}
+	}
+	lrows, err := s.db.Query(`
+SELECT ts, kind FROM lifecycle_events WHERE ts >= ? AND ts <= ?`, fromU, toU)
+	if err != nil {
+		return nil, err
+	}
+	defer lrows.Close()
+	for lrows.Next() {
+		var ts int64
+		var kind string
+		if err := lrows.Scan(&ts, &kind); err != nil {
+			return nil, err
+		}
+		life(ts, kind)
+	}
+	if err := lrows.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	for _, e := range s.pendingEvents {
+		if ts := e.Time.Unix(); ts >= fromU && ts <= toU {
+			life(ts, e.Kind)
 		}
 	}
 	s.mu.Unlock()
@@ -568,11 +684,87 @@ ON CONFLICT(node_id, bucket, span) DO UPDATE SET
 		return err
 	}
 
+	// Node metrics: fine→coarse, deltas summed, gauges kept at max,
+	// counts from the last fine bucket of each group.
+	mrows, err := tx.Query(`
+SELECT node_id, bucket, cpu_ms, rss_max, io_read, io_write, fds, threads,
+       procs, throttled_us, oom_kills, mem_limit, psi_cpu, psi_mem
+FROM node_metrics WHERE span = ? AND bucket < ? ORDER BY bucket`, fineS, fineCutoff)
+	if err != nil {
+		return err
+	}
+	cm := make(map[metricKey]*metricAcc)
+	for mrows.Next() {
+		var nodeID string
+		var bucket int64
+		var a metricAcc
+		if err := mrows.Scan(&nodeID, &bucket, &a.cpuMillis, &a.rssMax, &a.ioRead,
+			&a.ioWrite, &a.fds, &a.threads, &a.procs, &a.throttledUs,
+			&a.oomKills, &a.memLimit, &a.psiCPUx100, &a.psiMemX100); err != nil {
+			mrows.Close()
+			return err
+		}
+		k := metricKey{nodeID: nodeID, start: bucket / coarseS * coarseS}
+		c, ok := cm[k]
+		if !ok {
+			c = &metricAcc{}
+			cm[k] = c
+		}
+		c.cpuMillis += a.cpuMillis
+		c.ioRead += a.ioRead
+		c.ioWrite += a.ioWrite
+		c.throttledUs += a.throttledUs
+		c.oomKills += a.oomKills
+		if a.rssMax > c.rssMax {
+			c.rssMax = a.rssMax
+		}
+		if a.psiCPUx100 > c.psiCPUx100 {
+			c.psiCPUx100 = a.psiCPUx100
+		}
+		if a.psiMemX100 > c.psiMemX100 {
+			c.psiMemX100 = a.psiMemX100
+		}
+		// Rows are bucket-ordered: last wins for counts/limits.
+		c.fds, c.threads, c.procs, c.memLimit = a.fds, a.threads, a.procs, a.memLimit
+	}
+	mrows.Close()
+	if err := mrows.Err(); err != nil {
+		return err
+	}
+	for k, c := range cm {
+		if _, err := tx.Exec(`
+INSERT INTO node_metrics (node_id, bucket, span, cpu_ms, rss_max, io_read, io_write,
+  fds, threads, procs, throttled_us, oom_kills, mem_limit, psi_cpu, psi_mem)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(node_id, bucket, span) DO UPDATE SET
+  cpu_ms=cpu_ms+excluded.cpu_ms, rss_max=MAX(rss_max, excluded.rss_max),
+  io_read=io_read+excluded.io_read, io_write=io_write+excluded.io_write,
+  fds=excluded.fds, threads=excluded.threads, procs=excluded.procs,
+  throttled_us=throttled_us+excluded.throttled_us,
+  oom_kills=oom_kills+excluded.oom_kills, mem_limit=excluded.mem_limit,
+  psi_cpu=MAX(psi_cpu, excluded.psi_cpu), psi_mem=MAX(psi_mem, excluded.psi_mem)`,
+			k.nodeID, k.start, coarseS,
+			c.cpuMillis, c.rssMax, c.ioRead, c.ioWrite,
+			c.fds, c.threads, c.procs, c.throttledUs, c.oomKills, c.memLimit,
+			c.psiCPUx100, c.psiMemX100); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM node_metrics WHERE span = ? AND bucket < ?`, fineS, fineCutoff); err != nil {
+		return err
+	}
+
 	coarseCutoff := now.Add(-s.coarseRetention).Unix()
 	if _, err := tx.Exec(`DELETE FROM edge_buckets WHERE bucket < ?`, coarseCutoff); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM node_presence WHERE bucket < ?`, coarseCutoff); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM node_metrics WHERE bucket < ?`, coarseCutoff); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM lifecycle_events WHERE ts < ?`, coarseCutoff); err != nil {
 		return err
 	}
 	return tx.Commit()

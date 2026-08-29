@@ -47,6 +47,8 @@ func TestEventLayoutMatchesBTF(t *testing.T) {
 		"sport":      offSport,
 		"dport":      offDport,
 		"srtt_us":    offSrttUs,
+		"code":       offCode,
+		"upath":      offUpath,
 	}
 	seen := map[string]bool{}
 	for _, m := range st.Members {
@@ -79,12 +81,14 @@ func TestObjectHasProgramsAndMaps(t *testing.T) {
 	for _, prog := range []string{
 		"atlas_sock_set_state", "atlas_inet_csk_accept_ret",
 		"atlas_tcp_retransmit", "atlas_tcp_receive_reset",
+		"atlas_unix_connect_entry", "atlas_unix_connect_ret",
+		"atlas_process_exec", "atlas_process_exit", "atlas_oom_victim",
 	} {
 		if spec.Programs[prog] == nil {
 			t.Errorf("program %q missing; have %v", prog, keys(spec.Programs))
 		}
 	}
-	for _, m := range []string{"events", "drop_count"} {
+	for _, m := range []string{"events", "drop_count", "unix_connects"} {
 		if spec.Maps[m] == nil {
 			t.Errorf("map %q missing; have %v", m, keys(spec.Maps))
 		}
@@ -170,10 +174,60 @@ func TestDecodeEventIPv6(t *testing.T) {
 	}
 }
 
+func TestDecodeUnixAndLifecycleEvents(t *testing.T) {
+	le := binary.LittleEndian
+	base := time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC)
+	toTime := func(uint64) time.Time { return base }
+
+	// Unix connect with a filesystem path and an errno.
+	b := make([]byte, EventSize)
+	le.PutUint32(b[offType:], uint32(model.EventUnixConnect))
+	le.PutUint32(b[offPID:], 42)
+	copy(b[offComm:], "python3\x00")
+	le.PutUint64(b[offSockID:], 999)
+	le.PutUint32(b[offCode:], 0xFFFFFF91) // -111 (-ECONNREFUSED) two's complement
+	copy(b[offUpath:], "/var/run/docker.sock\x00")
+	ev, err := DecodeEvent(b, toTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Path != "/var/run/docker.sock" || ev.Code != -111 || ev.SockID != 999 {
+		t.Fatalf("unix event = %+v", ev)
+	}
+
+	// Abstract socket name: leading NUL renders as "@".
+	copy(b[offUpath:], "\x00dbus-session\x00\x00")
+	ev, _ = DecodeEvent(b, toTime)
+	if ev.Path != "@dbus-session" {
+		t.Fatalf("abstract path = %q", ev.Path)
+	}
+
+	// Exec with filename and old pid.
+	b2 := make([]byte, EventSize)
+	le.PutUint32(b2[offType:], uint32(model.EventExec))
+	le.PutUint32(b2[offPID:], 100)
+	copy(b2[offComm:], "nginx\x00")
+	le.PutUint32(b2[offCode:], 99)
+	copy(b2[offUpath:], "/usr/sbin/nginx\x00")
+	ev, _ = DecodeEvent(b2, toTime)
+	if ev.Type != model.EventExec || ev.Path != "/usr/sbin/nginx" || ev.Code != 99 {
+		t.Fatalf("exec event = %+v", ev)
+	}
+
+	// Empty path stays empty.
+	b3 := make([]byte, EventSize)
+	le.PutUint32(b3[offType:], uint32(model.EventExit))
+	le.PutUint32(b3[offCode:], uint32(int32(139))) // 128+SIGSEGV style status
+	ev, _ = DecodeEvent(b3, toTime)
+	if ev.Path != "" || ev.Code != 139 {
+		t.Fatalf("exit event = %+v", ev)
+	}
+}
+
 func init() {
 	// Guard against accidental struct drift making EventSize inconsistent
 	// with the field offsets above.
-	if offSrttUs+4+4 != EventSize {
-		panic(fmt.Sprintf("event layout constants inconsistent: %d", offSrttUs+8))
+	if offUpath+upathLen != EventSize {
+		panic(fmt.Sprintf("event layout constants inconsistent: %d", offUpath+upathLen))
 	}
 }

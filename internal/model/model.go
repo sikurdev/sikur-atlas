@@ -28,6 +28,19 @@ const (
 	EventRetrans EventType = 5
 	// EventReset: the socket received an RST. Only SockID is meaningful.
 	EventReset EventType = 6
+	// EventUnixConnect: an AF_UNIX stream connect() returned. PID/Comm
+	// are the client, Path the target socket, Code the return value
+	// (0 or -errno), SockID the client socket's inode.
+	EventUnixConnect EventType = 7
+	// EventExec: a process exec'd. PID/Comm are the new identity, Path
+	// the executable, Code the pre-exec pid.
+	EventExec EventType = 8
+	// EventExit: a process (group leader) exited; Code is the raw
+	// kernel exit_code (status<<8, or the fatal signal in the low bits).
+	EventExit EventType = 9
+	// EventOOM: PID was chosen by the OOM killer. Only PID is
+	// meaningful.
+	EventOOM EventType = 10
 )
 
 func (t EventType) String() string {
@@ -44,6 +57,14 @@ func (t EventType) String() string {
 		return "retransmit"
 	case EventReset:
 		return "reset"
+	case EventUnixConnect:
+		return "unix-connect"
+	case EventExec:
+		return "exec"
+	case EventExit:
+		return "exit"
+	case EventOOM:
+		return "oom"
 	default:
 		return "unknown"
 	}
@@ -65,6 +86,14 @@ type ConnEvent struct {
 	// on EventEstablished the handshake RTT, on EventClose the mature
 	// estimate. 0 = not sampled.
 	SRTTMicros uint32
+	// Code carries the event-specific integer: connect retval
+	// (EventUnixConnect), raw exit_code (EventExit), old pid
+	// (EventExec).
+	Code int32
+	// Path carries the unix socket path (EventUnixConnect, abstract
+	// names prefixed "@") or the executable (EventExec). Truncated to
+	// 63 bytes by the kernel side.
+	Path string
 }
 
 // ProcessInfo is the userspace identity attached to a PID.

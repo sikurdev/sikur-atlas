@@ -62,11 +62,21 @@ func procPath(pid uint32, parts ...string) string {
 	return filepath.Join(append([]string{"/proc", strconv.FormatUint(uint64(pid), 10)}, parts...)...)
 }
 
-// ScanListeners walks /proc once and returns every listening TCP socket
-// with its owning process. Because /proc/<pid>/net/tcp shows that pid's
-// network namespace, one representative per namespace is parsed, which
-// covers containers as well as the host.
-func ScanListeners() []Listener {
+// ScanResult is one pass over /proc's socket-owning processes.
+type ScanResult struct {
+	Listeners []Listener
+	// InodeToPID maps any socket inode (TCP and unix alike) to the
+	// first process found holding it.
+	InodeToPID map[uint64]uint32
+}
+
+// ScanSockets walks /proc once and returns every listening TCP socket
+// with its owning process, plus the socket-inode ownership map (which
+// also covers AF_UNIX sockets — inodes are inodes). Because
+// /proc/<pid>/net/tcp shows that pid's network namespace, one
+// representative per namespace is parsed, which covers containers as
+// well as the host.
+func ScanSockets() ScanResult {
 	pids := listPIDs()
 
 	// socket inode -> owning pid, via each process's fd table.
@@ -122,7 +132,7 @@ func ScanListeners() []Listener {
 			}
 		}
 	}
-	return out
+	return ScanResult{Listeners: out, InodeToPID: inodeToPID}
 }
 
 func listPIDs() []uint32 {

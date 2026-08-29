@@ -28,9 +28,12 @@ const (
 	offSport     = 90
 	offDport     = 92
 	offSrttUs    = 96
+	offCode      = 100
+	offUpath     = 104
+	upathLen     = 64
 
 	// EventSize is sizeof(struct conn_event).
-	EventSize = 104
+	EventSize = 168
 )
 
 // DecodeEvent parses one raw ring buffer record. toTime converts the
@@ -56,8 +59,22 @@ func DecodeEvent(b []byte, toTime func(nsec uint64) time.Time) (model.ConnEvent,
 		BytesSent:  le.Uint64(b[offBytesSent:]),
 		BytesRecv:  le.Uint64(b[offBytesRecv:]),
 		SRTTMicros: le.Uint32(b[offSrttUs:]),
+		Code:       int32(le.Uint32(b[offCode:])),
+		Path:       pathString(b[offUpath : offUpath+upathLen]),
 	}
 	return ev, nil
+}
+
+// pathString decodes the kernel-truncated path buffer. An abstract unix
+// socket name arrives with a leading NUL and is rendered "@name".
+func pathString(b []byte) string {
+	if len(b) == 0 || b[0] == 0 && (len(b) < 2 || b[1] == 0) {
+		return ""
+	}
+	if b[0] == 0 {
+		return "@" + commString(b[1:])
+	}
+	return commString(b)
 }
 
 // addrPort builds an AddrPort from the kernel's 16-byte representation.

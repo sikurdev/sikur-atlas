@@ -26,6 +26,9 @@ type Meta struct {
 	DecodeErrors     uint64    `json:"decodeErrors"`
 	DockerEnrichment bool      `json:"dockerEnrichment"`
 	History          bool      `json:"history"`
+	// HostPSI is the host pressure-stall snapshot (resources.HostPSI);
+	// absent on kernels without PSI.
+	HostPSI any `json:"hostPsi,omitempty"`
 }
 
 // Config wires a Server.
@@ -64,6 +67,8 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("GET /api/stream", s.handleStream)
 	mux.HandleFunc("GET /api/timeline", s.handleTimeline)
 	mux.HandleFunc("GET /api/compare", s.handleCompare)
+	mux.HandleFunc("GET /api/lifecycle", s.handleLifecycle)
+	mux.HandleFunc("GET /api/metrics", s.handleMetrics)
 	mux.HandleFunc("GET /api/meta", s.handleMeta)
 	mux.HandleFunc("/", s.handleUI)
 	s.handler = mux
@@ -237,8 +242,102 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opts := appview.Options{SelfExe: s.cfg.SelfExe}
-	diff := appview.ComputeDiff(appview.Project(snapA, opts), appview.Project(snapB, opts))
+	viewA := appview.Project(snapA, opts)
+	viewB := appview.Project(snapB, opts)
+	diff := appview.ComputeDiff(viewA, viewB)
+
+	// Attach recorded lifecycle evidence, mapped onto the service graph
+	// (either era's membership may know the node).
+	events, err := s.cfg.History.LifecycleRange(a, b, "")
+	if err == nil {
+		members := viewB.MemberIndex()
+		membersA := viewA.MemberIndex()
+		labels := viewB.LabelIndex()
+		labelsA := viewA.LabelIndex()
+		for _, ev := range events {
+			svc, ok := members[ev.NodeID]
+			label := labels[svc]
+			if !ok {
+				if svc, ok = membersA[ev.NodeID]; !ok {
+					continue
+				}
+				label = labelsA[svc]
+			}
+			diff.Lifecycle = append(diff.Lifecycle, appview.LifecycleEntry{
+				Node: svc, Label: label, Kind: ev.Kind,
+				Detail: ev.Detail, Time: ev.Time,
+			})
+		}
+	}
 	writeJSON(w, diff)
+}
+
+// handleLifecycle serves recorded lifecycle events; node= filters by
+// raw node id.
+func (s *Server) handleLifecycle(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.History == nil {
+		http.Error(w, "history disabled", http.StatusNotFound)
+		return
+	}
+	q := r.URL.Query()
+	now := time.Now()
+	from := now.Add(-15 * time.Minute)
+	to := now
+	var err error
+	if v := q.Get("from"); v != "" {
+		if from, err = parseTime(v); err != nil {
+			http.Error(w, "bad from: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	if v := q.Get("to"); v != "" {
+		if to, err = parseTime(v); err != nil {
+			http.Error(w, "bad to: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	events, err := s.cfg.History.LifecycleRange(from, to, q.Get("node"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"events": events})
+}
+
+// handleMetrics serves a node's resource series.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.History == nil {
+		http.Error(w, "history disabled", http.StatusNotFound)
+		return
+	}
+	q := r.URL.Query()
+	nodeID := q.Get("node")
+	if nodeID == "" {
+		http.Error(w, "metrics needs node=", http.StatusBadRequest)
+		return
+	}
+	now := time.Now()
+	from := now.Add(-15 * time.Minute)
+	to := now
+	var err error
+	if v := q.Get("from"); v != "" {
+		if from, err = parseTime(v); err != nil {
+			http.Error(w, "bad from: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	if v := q.Get("to"); v != "" {
+		if to, err = parseTime(v); err != nil {
+			http.Error(w, "bad to: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	points, err := s.cfg.History.MetricsRange(nodeID, from, to)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"node": nodeID, "points": points})
 }
 
 func (s *Server) handleMeta(w http.ResponseWriter, _ *http.Request) {

@@ -186,6 +186,80 @@ func TestCompareEndpoint(t *testing.T) {
 	}
 }
 
+func TestLifecycleAndMetricsEndpoints(t *testing.T) {
+	store, hist, srv := testServer(t, false)
+	seed(store)
+	now := time.Now()
+
+	hist.NodeEvent("proc:/usr/sbin/nginx", "crash", 200, "killed by SIGSEGV (signal 11)", now.Add(-time.Minute))
+	hist.NodeSample("proc:/usr/sbin/nginx", graph.NodeMetrics{
+		CPUMillis: 1500, RSSBytes: 64 << 20, FDs: 12, Procs: 2, WindowSecs: 10,
+	}, now.Add(-30*time.Second))
+	if err := hist.Flush(now); err != nil {
+		t.Fatal(err)
+	}
+
+	var life struct {
+		Events []history.LifeEvent `json:"events"`
+	}
+	getJSON(t, fmt.Sprintf("%s/api/lifecycle?from=%d&to=%d", srv.URL, now.Add(-10*time.Minute).Unix(), now.Unix()), &life)
+	if len(life.Events) != 1 || life.Events[0].Kind != "crash" {
+		t.Fatalf("lifecycle = %+v", life)
+	}
+
+	var met struct {
+		Points []history.MetricPoint `json:"points"`
+	}
+	getJSON(t, fmt.Sprintf("%s/api/metrics?node=%s&from=%d&to=%d",
+		srv.URL, "proc:%2Fusr%2Fsbin%2Fnginx", now.Add(-10*time.Minute).Unix(), now.Unix()), &met)
+	if len(met.Points) != 1 || met.Points[0].Metrics.CPUMillis != 1500 {
+		t.Fatalf("metrics = %+v", met)
+	}
+
+	if resp := getJSON(t, srv.URL+"/api/metrics", nil); resp.StatusCode != 400 {
+		t.Fatalf("missing node => %d, want 400", resp.StatusCode)
+	}
+
+	// Replay attaches the sampled window to the node.
+	var snap graph.Snapshot
+	getJSON(t, fmt.Sprintf("%s/api/graph?at=%d", srv.URL, now.Unix()), &snap)
+	found := false
+	for _, n := range snap.Nodes {
+		if n.ID == "proc:/usr/sbin/nginx" {
+			found = true
+			if n.Metrics == nil || n.Metrics.CPUMillis != 1500 {
+				t.Fatalf("replay metrics = %+v", n.Metrics)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("nginx missing from replay: %+v", snap.Nodes)
+	}
+}
+
+func TestCompareCarriesLifecycle(t *testing.T) {
+	store, hist, srv := testServer(t, false)
+	seed(store)
+	base := time.Now().Add(-30 * time.Minute)
+
+	hist.EdgeOpened("proc:/usr/bin/curl->proc:/usr/sbin/nginx:8080", base)
+	hist.NodeEvent("proc:/usr/sbin/nginx", "oom", 200, "pid 200 chosen by the OOM killer", base.Add(5*time.Minute))
+	if err := hist.Flush(base.Add(6 * time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	var diff appview.Diff
+	getJSON(t, fmt.Sprintf("%s/api/compare?a=%d&b=%d",
+		srv.URL, base.Add(30*time.Second).Unix(), base.Add(10*time.Minute).Unix()), &diff)
+	if len(diff.Lifecycle) != 1 {
+		t.Fatalf("lifecycle in compare = %+v", diff.Lifecycle)
+	}
+	e := diff.Lifecycle[0]
+	if e.Kind != "oom" || e.Label != "nginx" || e.Node != "svc:proc:nginx" {
+		t.Fatalf("entry = %+v", e)
+	}
+}
+
 func TestTimelineGuards(t *testing.T) {
 	_, _, srv := testServer(t, false)
 	now := time.Now().Unix()

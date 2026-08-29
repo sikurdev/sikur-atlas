@@ -50,16 +50,41 @@ type Node struct {
 	Addrs          []string  `json:"addrs,omitempty"`
 	FirstSeen      time.Time `json:"firstSeen"`
 	LastSeen       time.Time `json:"lastSeen"`
+	// Metrics is the latest resource sample window (live view) or the
+	// reconstructed window (replay); nil when never sampled.
+	Metrics *NodeMetrics `json:"metrics,omitempty"`
+}
+
+// NodeMetrics is one resource window for a node, sampled from
+// procfs/cgroupfs.
+type NodeMetrics struct {
+	WindowSecs   int    `json:"windowSecs"`
+	CPUMillis    uint64 `json:"cpuMillis"` // CPU time consumed in the window
+	RSSBytes     uint64 `json:"rssBytes"`  // gauge (max within the window)
+	IOReadBytes  uint64 `json:"ioReadBytes"`
+	IOWriteBytes uint64 `json:"ioWriteBytes"`
+	FDs          int    `json:"fds"`
+	Threads      int    `json:"threads"`
+	Procs        int    `json:"procs"`
+	ThrottledUs  uint64 `json:"throttledUs"` // cgroup CPU throttling in the window
+	OOMKills     uint64 `json:"oomKills"`    // cgroup memory.events oom_kill delta
+	MemLimit     uint64 `json:"memLimit"`    // cgroup memory.max, 0 = none
+	// PSI some-avg10 percentages from the node's cgroup, when the
+	// kernel exposes them; 0 when unavailable.
+	PSICpuSomePct float64 `json:"psiCpuSomePct,omitempty"`
+	PSIMemSomePct float64 `json:"psiMemSomePct,omitempty"`
 }
 
 // Edge is observed communication between two nodes towards one server
 // port.
 type Edge struct {
-	ID          string    `json:"id"`
-	Src         string    `json:"src"`
-	Dst         string    `json:"dst"`
-	DstPort     uint16    `json:"dstPort"`
-	Protocol    string    `json:"protocol"`
+	ID       string `json:"id"`
+	Src      string `json:"src"`
+	Dst      string `json:"dst"`
+	DstPort  uint16 `json:"dstPort"`
+	Protocol string `json:"protocol"`
+	// Path is the AF_UNIX socket path for protocol "unix" edges.
+	Path        string    `json:"path,omitempty"`
 	Connections uint64    `json:"connections"`
 	ActiveConns int64     `json:"activeConns"`
 	BytesSent   uint64    `json:"bytesSent"`
@@ -186,6 +211,108 @@ func (s *Store) ConnectionClosed(edgeID string, bytesSent, bytesRecv uint64, at 
 	if at.After(e.LastSeen) {
 		e.LastSeen = at
 	}
+	s.bumpLocked()
+}
+
+// UnixEdgeID derives the stable id for an AF_UNIX edge.
+func UnixEdgeID(srcID, dstID, path string) string {
+	return srcID + "->" + dstID + ":unix:" + path
+}
+
+// unixEdgeLocked upserts the AF_UNIX edge shell.
+func (s *Store) unixEdgeLocked(src, dst NodeSpec, path string, at time.Time) *Edge {
+	s.upsertNodeLocked(src, at)
+	s.upsertNodeLocked(dst, at)
+	id := UnixEdgeID(src.ID, dst.ID, path)
+	e, ok := s.edges[id]
+	if !ok {
+		e = &Edge{
+			ID: id, Src: src.ID, Dst: dst.ID,
+			Protocol: "unix", Path: path, FirstSeen: at,
+		}
+		s.edges[id] = e
+	}
+	if at.After(e.LastSeen) {
+		e.LastSeen = at
+	}
+	return e
+}
+
+// UnixConnectObserved counts one successful AF_UNIX connect (exact,
+// from kernel events).
+func (s *Store) UnixConnectObserved(src, dst NodeSpec, path string, at time.Time) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.unixEdgeLocked(src, dst, path, at)
+	e.Connections++
+	s.bumpLocked()
+	return e.ID
+}
+
+// UnixPairUp raises the standing-connection gauge for a pair discovered
+// by the socket-table scan (sampled evidence).
+func (s *Store) UnixPairUp(src, dst NodeSpec, path string, at time.Time) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.unixEdgeLocked(src, dst, path, at)
+	e.ActiveConns++
+	s.bumpLocked()
+	return e.ID
+}
+
+// UnixPairDown releases a standing pair that vanished from the scan.
+func (s *Store) UnixPairDown(edgeID string, at time.Time) {
+	s.edgeCounter(edgeID, at, func(e *Edge) {
+		if e.ActiveConns > 0 {
+			e.ActiveConns--
+		}
+	})
+}
+
+// ObserveUnixFailure records a refused/failed AF_UNIX connect towards
+// path on the dst node.
+func (s *Store) ObserveUnixFailure(src, dst NodeSpec, path string, at time.Time) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.upsertNodeLocked(src, at)
+	s.upsertNodeLocked(dst, at)
+
+	id := UnixEdgeID(src.ID, dst.ID, path)
+	e, ok := s.edges[id]
+	if !ok {
+		e = &Edge{
+			ID: id, Src: src.ID, Dst: dst.ID,
+			Protocol: "unix", Path: path, FirstSeen: at,
+		}
+		s.edges[id] = e
+	}
+	e.Failures++
+	if at.After(e.LastSeen) {
+		e.LastSeen = at
+	}
+	s.bumpLocked()
+	return id
+}
+
+// HasNode reports whether a node id currently exists.
+func (s *Store) HasNode(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.nodes[id]
+	return ok
+}
+
+// SetNodeMetrics attaches the latest resource sample to a node.
+func (s *Store) SetNodeMetrics(nodeID string, m NodeMetrics) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.nodes[nodeID]
+	if !ok {
+		return
+	}
+	c := m
+	n.Metrics = &c
 	s.bumpLocked()
 }
 
@@ -419,6 +546,10 @@ func (s *Store) Snapshot() Snapshot {
 		c.PIDs = slices.Clone(n.PIDs)
 		c.ListenPorts = slices.Clone(n.ListenPorts)
 		c.Addrs = slices.Clone(n.Addrs)
+		if n.Metrics != nil {
+			m := *n.Metrics
+			c.Metrics = &m
+		}
 		snap.Nodes = append(snap.Nodes, c)
 	}
 	for _, e := range s.edges {

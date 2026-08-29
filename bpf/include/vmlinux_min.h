@@ -37,6 +37,7 @@ typedef __u32 __wsum;
 
 /* uapi/linux/bpf.h — only the constants we use. */
 enum bpf_map_type_min {
+	BPF_MAP_TYPE_HASH = 1,
 	BPF_MAP_TYPE_PERCPU_ARRAY = 6,
 	BPF_MAP_TYPE_RINGBUF = 27,
 };
@@ -141,6 +142,44 @@ struct tcp_sock {
 	__u64 bytes_received;
 	__u64 bytes_sent;
 	__u32 srtt_us;
+} __attribute__((preserve_access_index));
+
+/* Minimal fs/net glue to read a socket's inode number (the identity
+ * userspace pairing uses, matching what sock_diag reports). */
+struct inode {
+	unsigned long i_ino;
+} __attribute__((preserve_access_index));
+
+struct file {
+	struct inode *f_inode;
+} __attribute__((preserve_access_index));
+
+struct socket {
+	struct file *file;
+	struct sock *sk;
+} __attribute__((preserve_access_index));
+
+/* include/linux/sched.h — exit status of the exiting task. */
+struct task_struct {
+	int exit_code;
+} __attribute__((preserve_access_index));
+
+/* Tracepoint record for sched:sched_process_exec. filename is a
+ * __data_loc string: low 16 bits of the field are the offset of the
+ * string within the record. */
+struct trace_event_raw_sched_process_exec {
+	struct trace_entry ent;
+	__u32 __data_loc_filename;
+	int pid;
+	int old_pid;
+} __attribute__((preserve_access_index));
+
+/* Tracepoint record for oom:mark_victim. Only pid is read: it has been
+ * the first field since 4.19, while comm/uid/rss fields are recent
+ * additions. */
+struct trace_event_raw_mark_victim {
+	struct trace_entry ent;
+	int pid;
 } __attribute__((preserve_access_index));
 
 /* tcp:tcp_retransmit_skb's raw record: on older kernels the event is a

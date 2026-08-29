@@ -29,12 +29,17 @@
 char LICENSE[] SEC("license") = "GPL";
 
 enum atlas_event_type {
-	ATLAS_EV_OPEN = 1,        /* outbound connect initiated (has pid) */
-	ATLAS_EV_ACCEPT = 2,      /* inbound connection accepted (has pid) */
-	ATLAS_EV_ESTABLISHED = 3, /* handshake completed (pid unknown, has rtt) */
-	ATLAS_EV_CLOSE = 4,       /* socket closed (has bytes and rtt) */
-	ATLAS_EV_RETRANS = 5,     /* one segment retransmitted (sock_id only) */
-	ATLAS_EV_RST_RECV = 6,    /* RST received on a socket (sock_id only) */
+	ATLAS_EV_OPEN = 1,         /* outbound connect initiated (has pid) */
+	ATLAS_EV_ACCEPT = 2,       /* inbound connection accepted (has pid) */
+	ATLAS_EV_ESTABLISHED = 3,  /* handshake completed (pid unknown, has rtt) */
+	ATLAS_EV_CLOSE = 4,        /* socket closed (has bytes and rtt) */
+	ATLAS_EV_RETRANS = 5,      /* one segment retransmitted (sock_id only) */
+	ATLAS_EV_RST_RECV = 6,     /* RST received on a socket (sock_id only) */
+	ATLAS_EV_UNIX_CONNECT = 7, /* AF_UNIX stream connect returned (has pid,
+	                            * path, code=retval, sock_id=inode) */
+	ATLAS_EV_EXEC = 8,         /* process exec'd (path=filename, code=old pid) */
+	ATLAS_EV_EXIT = 9,         /* group leader exited (code=exit_code) */
+	ATLAS_EV_OOM = 10,         /* pid chosen by the OOM killer */
 };
 
 /* Wire format shared with the Go side (internal/ebpf/event.go). Layout is
@@ -55,7 +60,10 @@ struct conn_event {
 	__u16 dport;      /* remote port, host byte order */
 	__u16 _pad;
 	__u32 srtt_us;    /* smoothed RTT in µs, 0 = not sampled */
-	__u32 _pad2;
+	__s32 code;       /* EV_UNIX_CONNECT: connect retval (0 or -errno);
+	                   * EV_EXIT: task exit_code; EV_EXEC: old pid */
+	__u8 upath[64];   /* EV_UNIX_CONNECT: socket path (leading NUL =
+	                   * abstract); EV_EXEC: executable path. Truncated. */
 };
 
 /* Force BTF emission of the wire types: BTF only includes types reachable
@@ -79,6 +87,19 @@ struct {
 	__type(key, __u32);
 	__type(value, __u64);
 } drop_count SEC(".maps");
+
+/* Scratch state between unix_stream_connect entry and return. */
+struct unix_connect_args {
+	__u64 inode;
+	__u8 path[64];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, __u64);
+	__type(value, struct unix_connect_args);
+} unix_connects SEC(".maps");
 
 static __always_inline void note_drop(void)
 {
@@ -203,6 +224,111 @@ int atlas_tcp_retransmit(void *ctx)
 	if (!e)
 		return 0;
 	e->sock_id = (__u64)(unsigned long)skaddr;
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+/* ---- AF_UNIX topology ----
+ *
+ * unix_stream_connect(struct socket *, struct sockaddr *, int addr_len,
+ * int flags) runs in the connecting process's context; the entry probe
+ * captures the target path and the client socket's inode (the identity
+ * sock_diag pairing uses), the return probe reports success/failure. */
+SEC("kprobe/unix_stream_connect")
+int atlas_unix_connect_entry(struct pt_regs *ctx)
+{
+	struct socket *sock = (struct socket *)PT_REGS_PARM1(ctx);
+	const char *uaddr = (const char *)PT_REGS_PARM2(ctx);
+	int addr_len = (int)PT_REGS_PARM3(ctx);
+	struct unix_connect_args args = {};
+	__u64 id = bpf_get_current_pid_tgid();
+	__u32 len;
+
+	args.inode = BPF_CORE_READ(sock, file, f_inode, i_ino);
+	/* sockaddr_un: 2 bytes family, then the path (a leading NUL marks
+	 * an abstract name; addr_len bounds it). */
+	if (addr_len > 2) {
+		len = (__u32)addr_len - 2;
+		if (len > sizeof(args.path))
+			len = sizeof(args.path);
+		bpf_probe_read_kernel(args.path, len, uaddr + 2);
+	}
+	bpf_map_update_elem(&unix_connects, &id, &args, 0);
+	return 0;
+}
+
+SEC("kretprobe/unix_stream_connect")
+int atlas_unix_connect_ret(struct pt_regs *ctx)
+{
+	__u64 id = bpf_get_current_pid_tgid();
+	struct unix_connect_args *args;
+	struct conn_event *e;
+
+	args = bpf_map_lookup_elem(&unix_connects, &id);
+	if (!args)
+		return 0;
+	e = reserve_event(ATLAS_EV_UNIX_CONNECT);
+	if (e) {
+		e->sock_id = args->inode;
+		e->code = (__s32)PT_REGS_RC(ctx);
+		__builtin_memcpy(e->upath, args->path, sizeof(e->upath));
+		set_current_task(e);
+		bpf_ringbuf_submit(e, 0);
+	}
+	bpf_map_delete_elem(&unix_connects, &id);
+	return 0;
+}
+
+/* ---- process lifecycle ---- */
+
+SEC("tracepoint/sched/sched_process_exec")
+int atlas_process_exec(struct trace_event_raw_sched_process_exec *ctx)
+{
+	struct conn_event *e = reserve_event(ATLAS_EV_EXEC);
+	__u32 off;
+
+	if (!e)
+		return 0;
+	/* Runs in the exec'ing task past the point of no return: current
+	 * pid/comm are the NEW identity. */
+	set_current_task(e);
+	e->code = ctx->old_pid;
+	off = ctx->__data_loc_filename & 0xffff;
+	bpf_probe_read_kernel_str(e->upath, sizeof(e->upath), (char *)ctx + off);
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exit")
+int atlas_process_exit(void *ctx)
+{
+	__u64 id = bpf_get_current_pid_tgid();
+	struct task_struct *task;
+	struct conn_event *e;
+
+	/* Only group-leader exits: one event per process, not per thread. */
+	if ((__u32)id != (__u32)(id >> 32))
+		return 0;
+	e = reserve_event(ATLAS_EV_EXIT);
+	if (!e)
+		return 0;
+	set_current_task(e);
+	task = (struct task_struct *)bpf_get_current_task();
+	e->code = (__s32)BPF_CORE_READ(task, exit_code);
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+SEC("tracepoint/oom/mark_victim")
+int atlas_oom_victim(struct trace_event_raw_mark_victim *ctx)
+{
+	struct conn_event *e = reserve_event(ATLAS_EV_OOM);
+
+	if (!e)
+		return 0;
+	/* Fires in the allocating task's context, NOT the victim's; only
+	 * the victim pid from the record is meaningful. */
+	e->pid = (__u32)ctx->pid;
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }

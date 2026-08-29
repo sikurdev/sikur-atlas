@@ -67,6 +67,9 @@ func NewTracer() (*Tracer, error) {
 		{"sock", "inet_sock_set_state", "atlas_sock_set_state"},
 		{"tcp", "tcp_retransmit_skb", "atlas_tcp_retransmit"},
 		{"tcp", "tcp_receive_reset", "atlas_tcp_receive_reset"},
+		{"sched", "sched_process_exec", "atlas_process_exec"},
+		{"sched", "sched_process_exit", "atlas_process_exit"},
+		{"oom", "mark_victim", "atlas_oom_victim"},
 	} {
 		l, err := link.Tracepoint(tp.group, tp.name, coll.Programs[tp.prog], nil)
 		if err != nil {
@@ -74,6 +77,26 @@ func NewTracer() (*Tracer, error) {
 		}
 		t.links = append(t.links, l)
 	}
+
+	// AF_UNIX connect visibility: entry captures target path + inode,
+	// return reports the outcome.
+	ke, err := link.Kprobe("unix_stream_connect",
+		coll.Programs["atlas_unix_connect_entry"], nil)
+	if err != nil {
+		return nil, fmt.Errorf("attaching kprobe unix_stream_connect: %w", err)
+	}
+	t.links = append(t.links, ke)
+	kr, err := link.Kretprobe("unix_stream_connect",
+		coll.Programs["atlas_unix_connect_ret"],
+		&link.KprobeOptions{RetprobeMaxActive: 128})
+	if err != nil {
+		kr, err = link.Kretprobe("unix_stream_connect",
+			coll.Programs["atlas_unix_connect_ret"], nil)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("attaching kretprobe unix_stream_connect: %w", err)
+	}
+	t.links = append(t.links, kr)
 
 	// Raise maxactive: with the default, a burst of parallel accept()
 	// returns exhausts kretprobe instances and silently drops server

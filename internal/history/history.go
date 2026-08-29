@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,6 +73,12 @@ type Store struct {
 	flushing    map[bucketKey]*acc
 	active      map[string]int64 // per-edge open connections
 	metaVersion uint64           // last successfully committed graph version
+
+	// v0.3: lifecycle events and resource samples awaiting flush.
+	pendingEvents      []LifeEvent
+	pendingEventCounts map[string]int
+	eventsDropped      uint64
+	metrics            map[metricKey]*metricAcc
 }
 
 func mergeAcc(dst, src *acc) {
@@ -122,14 +129,16 @@ func Open(path string, graphStore *graph.Store, opts ...Option) (*Store, error) 
 	db.SetMaxOpenConns(1)
 
 	s := &Store{
-		db:              db,
-		graph:           graphStore,
-		fineSpan:        DefaultFineSpan,
-		coarseSpan:      DefaultCoarseSpan,
-		fineRetention:   DefaultFineRetention,
-		coarseRetention: DefaultCoarseRetention,
-		buckets:         make(map[bucketKey]*acc),
-		active:          make(map[string]int64),
+		db:                 db,
+		graph:              graphStore,
+		fineSpan:           DefaultFineSpan,
+		coarseSpan:         DefaultCoarseSpan,
+		fineRetention:      DefaultFineRetention,
+		coarseRetention:    DefaultCoarseRetention,
+		buckets:            make(map[bucketKey]*acc),
+		active:             make(map[string]int64),
+		pendingEventCounts: make(map[string]int),
+		metrics:            make(map[metricKey]*metricAcc),
 	}
 	for _, o := range opts {
 		o(s)
@@ -183,8 +192,50 @@ CREATE TABLE IF NOT EXISTS node_presence (
   PRIMARY KEY (node_id, bucket, span)
 );
 CREATE INDEX IF NOT EXISTS idx_node_presence_bucket ON node_presence(bucket);
+CREATE TABLE IF NOT EXISTS lifecycle_events (
+  id INTEGER PRIMARY KEY,
+  ts INTEGER NOT NULL,
+  node_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  pid INTEGER NOT NULL DEFAULT 0,
+  detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_ts ON lifecycle_events(ts);
+CREATE TABLE IF NOT EXISTS node_metrics (
+  node_id TEXT NOT NULL,
+  bucket INTEGER NOT NULL,
+  span INTEGER NOT NULL,
+  cpu_ms INTEGER NOT NULL DEFAULT 0,
+  rss_max INTEGER NOT NULL DEFAULT 0,
+  io_read INTEGER NOT NULL DEFAULT 0,
+  io_write INTEGER NOT NULL DEFAULT 0,
+  fds INTEGER NOT NULL DEFAULT 0,
+  threads INTEGER NOT NULL DEFAULT 0,
+  procs INTEGER NOT NULL DEFAULT 0,
+  throttled_us INTEGER NOT NULL DEFAULT 0,
+  oom_kills INTEGER NOT NULL DEFAULT 0,
+  mem_limit INTEGER NOT NULL DEFAULT 0,
+  psi_cpu INTEGER NOT NULL DEFAULT 0,
+  psi_mem INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (node_id, bucket, span)
+);
+CREATE INDEX IF NOT EXISTS idx_node_metrics_bucket ON node_metrics(bucket);
 `)
-	return err
+	if err != nil {
+		return err
+	}
+	// v0.2 → v0.3 upgrade: unix edges carry a socket path.
+	if _, err := s.db.Exec(`ALTER TABLE edges ADD COLUMN path TEXT NOT NULL DEFAULT ''`); err != nil {
+		// Duplicate column on an already-migrated database: fine.
+		if !isDuplicateColumn(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func isDuplicateColumn(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "duplicate column")
 }
 
 // Close flushes nothing (callers Flush first) and closes the database.
@@ -318,6 +369,20 @@ func (s *Store) Flush(now time.Time) error {
 	for k, v := range s.active {
 		activeSnapshot[k] = v
 	}
+	// Lifecycle events and completed metric buckets flush in the same
+	// transaction. Pending events remain visible to LifecycleRange via
+	// doneEvents until requeued or committed... they are drained here
+	// and requeued on failure like the counters.
+	doneEvents := s.pendingEvents
+	s.pendingEvents = nil
+	s.pendingEventCounts = make(map[string]int)
+	doneMetrics := make(map[metricKey]*metricAcc)
+	for k, a := range s.metrics {
+		if k.start < cutoff {
+			doneMetrics[k] = a
+			delete(s.metrics, k)
+		}
+	}
 	// Readers merge s.flushing, so the drained interval stays visible
 	// while the transaction runs. (Between commit and the clear below a
 	// reader could briefly double-count the interval — a microsecond
@@ -325,7 +390,7 @@ func (s *Store) Flush(now time.Time) error {
 	s.flushing = done
 	s.mu.Unlock()
 
-	committedVersion, err := s.flushTx(done, activeSnapshot, now, lastBucket, span)
+	committedVersion, err := s.flushTx(done, doneEvents, doneMetrics, activeSnapshot, now, lastBucket, span)
 
 	s.mu.Lock()
 	s.flushing = nil
@@ -337,6 +402,15 @@ func (s *Store) Flush(now time.Time) error {
 				s.buckets[k] = a
 			}
 		}
+		s.pendingEvents = append(doneEvents, s.pendingEvents...)
+		for _, e := range doneEvents {
+			s.pendingEventCounts[e.NodeID]++
+		}
+		for k, a := range doneMetrics {
+			if _, ok := s.metrics[k]; !ok {
+				s.metrics[k] = a
+			}
+		}
 	} else if committedVersion != 0 {
 		s.metaVersion = committedVersion
 	}
@@ -344,12 +418,39 @@ func (s *Store) Flush(now time.Time) error {
 	return err
 }
 
-func (s *Store) flushTx(done map[bucketKey]*acc, activeSnapshot map[string]int64, now time.Time, lastBucket, span int64) (uint64, error) {
+func (s *Store) flushTx(done map[bucketKey]*acc, doneEvents []LifeEvent, doneMetrics map[metricKey]*metricAcc, activeSnapshot map[string]int64, now time.Time, lastBucket, span int64) (uint64, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+
+	for _, e := range doneEvents {
+		if _, err := tx.Exec(`
+INSERT INTO lifecycle_events (ts, node_id, kind, pid, detail) VALUES (?,?,?,?,?)`,
+			e.Time.Unix(), e.NodeID, e.Kind, e.PID, e.Detail); err != nil {
+			return 0, err
+		}
+	}
+	for k, a := range doneMetrics {
+		if _, err := tx.Exec(`
+INSERT INTO node_metrics (node_id, bucket, span, cpu_ms, rss_max, io_read, io_write,
+  fds, threads, procs, throttled_us, oom_kills, mem_limit, psi_cpu, psi_mem)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(node_id, bucket, span) DO UPDATE SET
+  cpu_ms=cpu_ms+excluded.cpu_ms, rss_max=MAX(rss_max, excluded.rss_max),
+  io_read=io_read+excluded.io_read, io_write=io_write+excluded.io_write,
+  fds=excluded.fds, threads=excluded.threads, procs=excluded.procs,
+  throttled_us=throttled_us+excluded.throttled_us,
+  oom_kills=oom_kills+excluded.oom_kills, mem_limit=excluded.mem_limit,
+  psi_cpu=MAX(psi_cpu, excluded.psi_cpu), psi_mem=MAX(psi_mem, excluded.psi_mem)`,
+			k.nodeID, k.start, int64(s.fineSpan.Seconds()),
+			a.cpuMillis, a.rssMax, a.ioRead, a.ioWrite,
+			a.fds, a.threads, a.procs, a.throttledUs, a.oomKills, a.memLimit,
+			a.psiCPUx100, a.psiMemX100); err != nil {
+			return 0, err
+		}
+	}
 
 	for k, a := range done {
 		// active_end only means "open connections as of this flush" for
@@ -455,10 +556,10 @@ ON CONFLICT(node_id, bucket, span) DO UPDATE SET
 		for i := range snap.Edges {
 			e := &snap.Edges[i]
 			if _, err := tx.Exec(`
-INSERT INTO edges (id, src, dst, dst_port, protocol, first_seen, last_seen)
-VALUES (?,?,?,?,?,?,?)
+INSERT INTO edges (id, src, dst, dst_port, protocol, path, first_seen, last_seen)
+VALUES (?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen`,
-				e.ID, e.Src, e.Dst, e.DstPort, e.Protocol,
+				e.ID, e.Src, e.Dst, e.DstPort, e.Protocol, e.Path,
 				e.FirstSeen.Unix(), e.LastSeen.Unix(),
 			); err != nil {
 				return 0, err

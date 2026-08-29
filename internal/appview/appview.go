@@ -43,15 +43,20 @@ type Node struct {
 	ListenPorts []uint16  `json:"listenPorts,omitempty"`
 	FirstSeen   time.Time `json:"firstSeen"`
 	LastSeen    time.Time `json:"lastSeen"`
+	// Metrics aggregates member resources: deltas and RSS summed,
+	// PSI at the member maximum.
+	Metrics *graph.NodeMetrics `json:"metrics,omitempty"`
 }
 
-// Edge is aggregated communication between two services on one port.
+// Edge is aggregated communication between two services on one port
+// (TCP) or one socket path (unix).
 type Edge struct {
 	ID          string            `json:"id"`
 	Src         string            `json:"src"`
 	Dst         string            `json:"dst"`
 	DstPort     uint16            `json:"dstPort"`
 	Protocol    string            `json:"protocol"`
+	Path        string            `json:"path,omitempty"`
 	Connections uint64            `json:"connections"`
 	ActiveConns int64             `json:"activeConns"`
 	BytesSent   uint64            `json:"bytesSent"`
@@ -150,6 +155,9 @@ func Project(snap graph.Snapshot, opts Options) Graph {
 		if n.LastSeen.After(svc.LastSeen) {
 			svc.LastSeen = n.LastSeen
 		}
+		if n.Metrics != nil {
+			svc.Metrics = mergeMetrics(svc.Metrics, n.Metrics)
+		}
 	}
 	if len(externalMembers) > 0 {
 		slices.Sort(externalMembers)
@@ -174,12 +182,18 @@ func Project(snap graph.Snapshot, opts Options) Graph {
 			// carries no dependency information at this level.
 			continue
 		}
-		id := src + "->" + dst + ":" + portString(e.DstPort)
+		var id string
+		if e.Protocol == "unix" {
+			id = src + "->" + dst + ":unix:" + e.Path
+		} else {
+			id = src + "->" + dst + ":" + portString(e.DstPort)
+		}
 		se, ok := svcEdges[id]
 		if !ok {
 			se = &Edge{
 				ID: id, Src: src, Dst: dst, DstPort: e.DstPort,
-				Protocol: e.Protocol, FirstSeen: e.FirstSeen, LastSeen: e.LastSeen,
+				Protocol: e.Protocol, Path: e.Path,
+				FirstSeen: e.FirstSeen, LastSeen: e.LastSeen,
 			}
 			svcEdges[id] = se
 		}
@@ -281,6 +295,56 @@ func mergeWindow(dst, src *graph.EdgeWindow) {
 	dst.BytesSent += src.BytesSent
 	dst.BytesRecv += src.BytesRecv
 	dst.ActiveEnd += src.ActiveEnd
+}
+
+// MemberIndex maps every raw member node id to its service id.
+func (g Graph) MemberIndex() map[string]string {
+	out := make(map[string]string)
+	for _, n := range g.Nodes {
+		for _, m := range n.Members {
+			out[m] = n.ID
+		}
+	}
+	return out
+}
+
+// LabelIndex maps service ids to display labels.
+func (g Graph) LabelIndex() map[string]string {
+	out := make(map[string]string, len(g.Nodes))
+	for _, n := range g.Nodes {
+		out[n.ID] = n.Label
+	}
+	return out
+}
+
+// mergeMetrics folds one member's resources into a service aggregate:
+// deltas and sizes sum, PSI keeps the worst member, the window length is
+// shared.
+func mergeMetrics(dst, src *graph.NodeMetrics) *graph.NodeMetrics {
+	if dst == nil {
+		c := *src
+		return &c
+	}
+	dst.CPUMillis += src.CPUMillis
+	dst.RSSBytes += src.RSSBytes
+	dst.IOReadBytes += src.IOReadBytes
+	dst.IOWriteBytes += src.IOWriteBytes
+	dst.FDs += src.FDs
+	dst.Threads += src.Threads
+	dst.Procs += src.Procs
+	dst.ThrottledUs += src.ThrottledUs
+	dst.OOMKills += src.OOMKills
+	dst.MemLimit += src.MemLimit
+	if src.PSICpuSomePct > dst.PSICpuSomePct {
+		dst.PSICpuSomePct = src.PSICpuSomePct
+	}
+	if src.PSIMemSomePct > dst.PSIMemSomePct {
+		dst.PSIMemSomePct = src.PSIMemSomePct
+	}
+	if src.WindowSecs > dst.WindowSecs {
+		dst.WindowSecs = src.WindowSecs
+	}
+	return dst
 }
 
 func portString(p uint16) string {

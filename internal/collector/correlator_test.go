@@ -570,6 +570,9 @@ type fakeRecorder struct {
 	failures                int
 	retrans, resets         uint64
 	rtts                    []uint32
+	connects                uint64
+	activeDelta             int64
+	nodeEvents              []string
 }
 
 func (r *fakeRecorder) EdgeOpened(string, time.Time) { r.opened++ }
@@ -587,6 +590,13 @@ func (r *fakeRecorder) EdgeRTT(_ string, rtt uint32, _ time.Time) {
 	if rtt > 0 {
 		r.rtts = append(r.rtts, rtt)
 	}
+}
+func (r *fakeRecorder) EdgeConnects(_ string, n uint64, _ time.Time) { r.connects += n }
+func (r *fakeRecorder) EdgeActive(_ string, delta int64, _ time.Time) {
+	r.activeDelta += delta
+}
+func (r *fakeRecorder) NodeEvent(nodeID, kind string, _ uint32, detail string, _ time.Time) {
+	r.nodeEvents = append(r.nodeEvents, nodeID+"|"+kind+"|"+detail)
 }
 
 // Every EdgeOpened must be balanced by exactly one EdgeClosed or

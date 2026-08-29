@@ -1,6 +1,7 @@
 package appview
 
 import (
+	"github.com/sikurdev/sikur-atlas/internal/graph"
 	"slices"
 	"strings"
 	"time"
@@ -16,6 +17,29 @@ type Diff struct {
 	AddedEdges   []Edge       `json:"addedEdges"`
 	RemovedEdges []Edge       `json:"removedEdges"`
 	ChangedEdges []EdgeChange `json:"changedEdges"`
+	ChangedNodes []NodeChange `json:"changedNodes"`
+	// Lifecycle lists recorded exec/exit/crash/oom events between the
+	// two moments, grouped to services by the API layer.
+	Lifecycle []LifecycleEntry `json:"lifecycle"`
+}
+
+// NodeChange is a service present at both moments whose resources moved
+// meaningfully.
+type NodeChange struct {
+	Node    Node     `json:"node"` // B-side values
+	Changes []string `json:"changes"`
+	// A-side values for delta rendering.
+	ACPUMillis uint64 `json:"aCpuMillis"`
+	ARSSBytes  uint64 `json:"aRssBytes"`
+}
+
+// LifecycleEntry is one lifecycle event mapped onto the service graph.
+type LifecycleEntry struct {
+	Node   string    `json:"node"`  // service id
+	Label  string    `json:"label"` // service label
+	Kind   string    `json:"kind"`  // exec | exit | crash | oom
+	Detail string    `json:"detail"`
+	Time   time.Time `json:"time"`
 }
 
 // EdgeChange is an edge present at both moments whose health moved
@@ -102,8 +126,49 @@ func ComputeDiff(a, b Graph) Diff {
 		}
 	}
 
+	for _, n := range b.Nodes {
+		an, ok := aNodes[n.ID]
+		if !ok || an.Metrics == nil || n.Metrics == nil {
+			continue
+		}
+		if changes := nodeChanges(*an.Metrics, *n.Metrics); len(changes) > 0 {
+			d.ChangedNodes = append(d.ChangedNodes, NodeChange{
+				Node:       n,
+				Changes:    changes,
+				ACPUMillis: an.Metrics.CPUMillis,
+				ARSSBytes:  an.Metrics.RSSBytes,
+			})
+		}
+	}
+
 	sortDiff(&d)
 	return d
+}
+
+// Node metric thresholds: same relative rule as edges, with resource
+// floors (CPU 250 ms per window, RSS 32 MiB, throttling 100 ms). New
+// OOM kills always count.
+const (
+	cpuFloorMillis  = 250
+	rssFloorBytes   = 32 * 1024 * 1024
+	throttleFloorUs = 100_000
+)
+
+func nodeChanges(a, b graph.NodeMetrics) []string {
+	var out []string
+	if b.OOMKills > a.OOMKills {
+		out = append(out, "oomkill")
+	}
+	if moved(float64(a.CPUMillis), float64(b.CPUMillis), cpuFloorMillis) {
+		out = append(out, "cpu")
+	}
+	if moved(float64(a.RSSBytes), float64(b.RSSBytes), rssFloorBytes) {
+		out = append(out, "rss")
+	}
+	if moved(float64(a.ThrottledUs), float64(b.ThrottledUs), throttleFloorUs) {
+		out = append(out, "throttle")
+	}
+	return out
 }
 
 func windowRTT(e Edge) uint32 {
@@ -167,5 +232,17 @@ func sortDiff(d *Diff) {
 	slices.SortFunc(d.RemovedEdges, byEdgeID)
 	slices.SortFunc(d.ChangedEdges, func(a, b EdgeChange) int {
 		return strings.Compare(a.Edge.ID, b.Edge.ID)
+	})
+	slices.SortFunc(d.ChangedNodes, func(a, b NodeChange) int {
+		return strings.Compare(a.Node.ID, b.Node.ID)
+	})
+	slices.SortFunc(d.Lifecycle, func(a, b LifecycleEntry) int {
+		if !a.Time.Equal(b.Time) {
+			if a.Time.Before(b.Time) {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(a.Node, b.Node)
 	})
 }
