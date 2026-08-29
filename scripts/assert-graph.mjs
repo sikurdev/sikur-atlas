@@ -127,11 +127,25 @@ const appGatewayOrders = app.edges.find(
 if (!appGatewayOrders) {
   failures.push("app view missing gateway -> orders service edge");
 }
-// The app view must be materially smaller than the raw view.
-if (!(app.nodes.length < graph.nodes.length)) {
+// The app view aggregates: never more nodes than raw, and when several
+// external endpoints exist they must collapse into the one aggregate.
+if (app.nodes.length > graph.nodes.length) {
   failures.push(
-    `app view not cleaner: ${app.nodes.length} service nodes vs ${graph.nodes.length} raw`,
+    `app view grew: ${app.nodes.length} service nodes vs ${graph.nodes.length} raw`,
   );
+}
+const rawExternals = graph.nodes.filter((n) => n.kind === "external").length;
+const appExternals = app.nodes.filter((n) => n.category === "external");
+if (rawExternals >= 2) {
+  if (appExternals.length !== 1) {
+    failures.push(
+      `external endpoints not aggregated: ${rawExternals} raw -> ${appExternals.length} app nodes`,
+    );
+  } else if (appExternals[0].memberCount !== rawExternals) {
+    failures.push(
+      `external aggregate lost members: ${appExternals[0].memberCount} of ${rawExternals}`,
+    );
+  }
 }
 
 if (meta.kernelDrops > 0) failures.push(`ring buffer dropped ${meta.kernelDrops} events`);

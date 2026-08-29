@@ -116,6 +116,10 @@ export class GraphSim {
     return this.sim.nodes();
   }
 
+  byId(id: string): SimNode | undefined {
+    return this.nodesById.get(id);
+  }
+
   edges(): SimEdge[] {
     return this.simEdges;
   }

@@ -174,6 +174,30 @@ func TestCompareEndpoint(t *testing.T) {
 	if resp := getJSON(t, srv.URL+"/api/compare?a=1", nil); resp.StatusCode != 400 {
 		t.Fatalf("missing b => %d, want 400", resp.StatusCode)
 	}
+
+	// Reversed order must not invert added/removed: the server
+	// normalizes to A = earlier.
+	swapped := fmt.Sprintf("%s/api/compare?a=%d&b=%d",
+		srv.URL, base.Add(20*time.Minute).Unix(), base.Add(30*time.Second).Unix())
+	var diff2 appview.Diff
+	getJSON(t, swapped, &diff2)
+	if len(diff2.RemovedEdges) != 1 || len(diff2.AddedEdges) != 0 {
+		t.Fatalf("reversed compare inverted the diff: %+v", diff2)
+	}
+}
+
+func TestTimelineGuards(t *testing.T) {
+	_, _, srv := testServer(t, false)
+	now := time.Now().Unix()
+
+	// Unbounded bucket count is refused, not materialized.
+	if resp := getJSON(t, fmt.Sprintf("%s/api/timeline?from=0&to=%d&step=10", srv.URL, now), nil); resp.StatusCode != 400 {
+		t.Fatalf("huge range => %d, want 400", resp.StatusCode)
+	}
+	// Inverted range is a client error.
+	if resp := getJSON(t, fmt.Sprintf("%s/api/timeline?from=%d&to=%d", srv.URL, now, now-100), nil); resp.StatusCode != 400 {
+		t.Fatalf("inverted range => %d, want 400", resp.StatusCode)
+	}
 }
 
 func TestTimelineEndpoint(t *testing.T) {

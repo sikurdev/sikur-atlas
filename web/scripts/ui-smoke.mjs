@@ -78,9 +78,14 @@ try {
   ok(`raw drill-down shows ${rawNodes} raw nodes (>= ${liveNodes} services)`);
   await page.getByTestId("btn-view-app").click();
 
-  // ---- timeline is present and live ----
+  // ---- timeline is present and carries real activity bars ----
   await page.waitForSelector('[data-testid="timeline-strip"]', { timeout: 5000 });
-  ok("timeline strip renders");
+  await page.waitForFunction(
+    () => document.querySelectorAll(".tl-activity").length >= 1,
+    undefined,
+    { timeout: 15000 },
+  );
+  ok("timeline strip renders recorded activity");
 
   if (t1 != null) {
     // ---- Replay at T1: the stopped service is back on screen ----

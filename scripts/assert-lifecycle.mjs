@@ -65,6 +65,21 @@ if (removedIDs.includes("svc:compose:atlas-demo/gateway")) {
   failures.push("compare: gateway wrongly reported removed");
 }
 
+// The timeline must carry the recorded activity across both eras.
+const tl = await getJSON(
+  `${base}/api/timeline?from=${t1 - 60}&to=${t2}&step=10`,
+);
+const tlOpens = tl.buckets.reduce((sum, b) => sum + b.opens, 0);
+if (!(tlOpens > 10)) {
+  failures.push(`timeline shows almost no activity: ${tlOpens} opens`);
+}
+const nearT1 = tl.buckets.filter(
+  (b) => b.start >= t1 - 60 && b.start <= t1 && b.opens > 0,
+);
+if (nearT1.length === 0) {
+  failures.push("timeline empty around T1 despite recorded traffic");
+}
+
 console.log(`== ${label}: replay + compare ==`);
 console.log(
   `T1 view: ${atT1.nodes.length} services / ${atT1.edges.length} edges; ` +

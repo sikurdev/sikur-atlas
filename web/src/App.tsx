@@ -114,7 +114,14 @@ export function App({ makeSource }: { makeSource?: () => EventSource }) {
           setReplayApp(app);
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        // Never leave a previous moment's graph on screen under this
+        // moment's header.
+        if (!stale) {
+          setReplayRaw(null);
+          setReplayApp(null);
+        }
+      });
     return () => {
       stale = true;
     };
@@ -137,7 +144,12 @@ export function App({ makeSource }: { makeSource?: () => EventSource }) {
           setCompareB(b);
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!stale) {
+          setDiff(null);
+          setCompareB(null);
+        }
+      });
     return () => {
       stale = true;
     };
@@ -174,10 +186,13 @@ export function App({ makeSource }: { makeSource?: () => EventSource }) {
     [display, showSystem, view],
   );
 
-  const focusSets = useMemo(
-    () => (focusId != null ? computeFocus(filtered, focusId) : null),
-    [filtered, focusId],
-  );
+  // Focus only applies while the focused node is on screen; a node id
+  // from another view or era must not dim the whole graph.
+  const focusSets = useMemo(() => {
+    if (focusId == null) return null;
+    if (!filtered.nodes.some((n) => n.id === focusId)) return null;
+    return computeFocus(filtered, focusId);
+  }, [filtered, focusId]);
 
   const refTimeMs =
     mode.kind === "live"
@@ -207,6 +222,14 @@ export function App({ makeSource }: { makeSource?: () => EventSource }) {
     setPinnedA(null);
   }, []);
 
+  // Node/edge ids differ between the two views, so a selection or focus
+  // cannot survive a view switch.
+  const switchView = useCallback((v: ViewMode) => {
+    setView(v);
+    setSelection(null);
+    setFocusId(null);
+  }, []);
+
   const statusLabel =
     mode.kind === "live"
       ? STATUS_LABEL[status]
@@ -223,14 +246,14 @@ export function App({ makeSource }: { makeSource?: () => EventSource }) {
         <span className="seg" data-testid="seg-view">
           <button
             className={view === "app" ? "on" : ""}
-            onClick={() => setView("app")}
+            onClick={() => switchView("app")}
             data-testid="btn-view-app"
           >
             Services
           </button>
           <button
             className={view === "raw" ? "on" : ""}
-            onClick={() => setView("raw")}
+            onClick={() => switchView("raw")}
             data-testid="btn-view-raw"
           >
             Raw
@@ -304,7 +327,7 @@ export function App({ makeSource }: { makeSource?: () => EventSource }) {
           focus={focusId}
           onFocus={setFocusId}
           onShowRaw={(q) => {
-            setView("raw");
+            switchView("raw");
             setQuery(q);
           }}
           rawView={view === "raw"}

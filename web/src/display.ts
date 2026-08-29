@@ -142,14 +142,19 @@ export function fromDiff(diff: Diff, bView: AppGraph): DisplayGraph {
   }
   const present = new Set(g.nodes.map((n) => n.id));
   for (const n of diff.removedNodes ?? []) {
+    // The diff and the B view come from two requests; if a flush landed
+    // between them a "removed" node can also exist in B. Never draw a
+    // duplicate id.
+    if (present.has(n.id)) continue;
     const dn = displayNodeFromApp(n);
     dn.diff = "removed";
     g.nodes.push(dn);
     present.add(dn.id);
   }
+  const edgeIDs = new Set(g.edges.map((e) => e.id));
   for (const e of diff.removedEdges ?? []) {
-    // Only draw removed edges whose endpoints are drawable.
-    if (!present.has(e.src) || !present.has(e.dst)) continue;
+    // Only draw removed edges whose endpoints are drawable, once.
+    if (!present.has(e.src) || !present.has(e.dst) || edgeIDs.has(e.id)) continue;
     const de = displayEdgeFromApp(e);
     de.diff = "removed";
     g.edges.push(de);

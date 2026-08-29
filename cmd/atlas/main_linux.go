@@ -86,6 +86,13 @@ func run(listen, dockerSocket, dbPath string, scanInterval time.Duration) error 
 		return fmt.Errorf("opening history database: %w", err)
 	}
 	defer hist.Close()
+	// LIFO: the final flush (including the open bucket) runs before the
+	// deferred Close, so shutdown cannot race the last interval away.
+	defer func() {
+		if err := hist.FinalFlush(); err != nil {
+			log.Printf("history: final flush: %v", err)
+		}
+	}()
 	go hist.Run(ctx, func(err error) { log.Printf("history: %v", err) })
 	log.Printf("topology history at %s", dbPath)
 

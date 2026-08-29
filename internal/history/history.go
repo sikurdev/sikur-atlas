@@ -64,10 +64,29 @@ type Store struct {
 	fineRetention   time.Duration
 	coarseRetention time.Duration
 
-	mu          sync.Mutex
-	buckets     map[bucketKey]*acc
+	mu      sync.Mutex
+	buckets map[bucketKey]*acc
+	// flushing stages drained buckets while their transaction is in
+	// flight, so readers never see a gap and a failed flush can requeue
+	// instead of losing telemetry.
+	flushing    map[bucketKey]*acc
 	active      map[string]int64 // per-edge open connections
-	metaVersion uint64           // last flushed graph version
+	metaVersion uint64           // last successfully committed graph version
+}
+
+func mergeAcc(dst, src *acc) {
+	dst.opens += src.opens
+	dst.closes += src.closes
+	dst.failures += src.failures
+	dst.resets += src.resets
+	dst.retrans += src.retrans
+	dst.bytesSent += src.bytesSent
+	dst.bytesRecv += src.bytesRecv
+	dst.rttSumUs += src.rttSumUs
+	dst.rttCount += src.rttCount
+	if src.rttMaxUs > dst.rttMaxUs {
+		dst.rttMaxUs = src.rttMaxUs
+	}
 }
 
 // Option configures a Store.
@@ -260,9 +279,13 @@ func (s *Store) EdgeRTT(edgeID string, rttUs uint32, at time.Time) {
 
 // Flush writes all buckets that ended at or before now, plus node/edge
 // metadata and presence rows. The current (still open) bucket stays in
-// memory.
+// memory. Drained buckets are staged (still visible to readers) until
+// the transaction commits, and requeued if it fails, so a transient
+// database error never loses telemetry.
 func (s *Store) Flush(now time.Time) error {
 	cutoff := now.Truncate(s.fineSpan).Unix()
+	span := int64(s.fineSpan.Seconds())
+	lastBucket := cutoff - span
 
 	s.mu.Lock()
 	done := make(map[bucketKey]*acc)
@@ -274,11 +297,16 @@ func (s *Store) Flush(now time.Time) error {
 			delete(s.buckets, k)
 		}
 	}
-	// Idle-but-open edges keep their presence alive with an empty row
-	// carrying the active count, in the just-completed bucket.
-	lastBucket := cutoff - int64(s.fineSpan.Seconds())
+	// Idle-but-open edges keep their presence alive with an empty row —
+	// but only edges whose activity is NOT in the still-open bucket:
+	// writing a row for those would backdate them into an era before
+	// they existed.
+	current := make(map[string]bool)
+	for k := range s.buckets {
+		current[k.edgeID] = true
+	}
 	for edgeID, n := range s.active {
-		if n <= 0 {
+		if n <= 0 || current[edgeID] {
 			continue
 		}
 		k := bucketKey{edgeID: edgeID, start: lastBucket}
@@ -290,16 +318,48 @@ func (s *Store) Flush(now time.Time) error {
 	for k, v := range s.active {
 		activeSnapshot[k] = v
 	}
+	// Readers merge s.flushing, so the drained interval stays visible
+	// while the transaction runs. (Between commit and the clear below a
+	// reader could briefly double-count the interval — a microsecond
+	// in-memory window, preferred over the old full-interval gap.)
+	s.flushing = done
 	s.mu.Unlock()
 
+	committedVersion, err := s.flushTx(done, activeSnapshot, now, lastBucket, span)
+
+	s.mu.Lock()
+	s.flushing = nil
+	if err != nil {
+		for k, a := range done {
+			if exist, ok := s.buckets[k]; ok {
+				mergeAcc(exist, a)
+			} else {
+				s.buckets[k] = a
+			}
+		}
+	} else if committedVersion != 0 {
+		s.metaVersion = committedVersion
+	}
+	s.mu.Unlock()
+	return err
+}
+
+func (s *Store) flushTx(done map[bucketKey]*acc, activeSnapshot map[string]int64, now time.Time, lastBucket, span int64) (uint64, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 
-	span := int64(s.fineSpan.Seconds())
 	for k, a := range done {
+		// active_end only means "open connections as of this flush" for
+		// the just-completed bucket; a late write into an older bucket
+		// (a stashed close applied after its bucket flushed) must not
+		// stamp a present-day count into a past era.
+		activeEnd := int64(0)
+		if k.start >= lastBucket {
+			activeEnd = activeSnapshot[k.edgeID]
+		}
 		if _, err := tx.Exec(`
 INSERT INTO edge_buckets (edge_id, bucket, span, opens, closes, failures, resets, retrans,
   bytes_sent, bytes_recv, rtt_sum_us, rtt_count, rtt_max_us, active_end)
@@ -311,30 +371,37 @@ ON CONFLICT(edge_id, bucket, span) DO UPDATE SET
   bytes_sent=bytes_sent+excluded.bytes_sent, bytes_recv=bytes_recv+excluded.bytes_recv,
   rtt_sum_us=rtt_sum_us+excluded.rtt_sum_us, rtt_count=rtt_count+excluded.rtt_count,
   rtt_max_us=MAX(rtt_max_us, excluded.rtt_max_us),
-  active_end=excluded.active_end`,
+  active_end=CASE WHEN edge_buckets.bucket >= ? THEN excluded.active_end
+                  ELSE edge_buckets.active_end END`,
 			k.edgeID, k.start, span,
 			a.opens, a.closes, a.failures, a.resets, a.retrans,
 			a.bytesSent, a.bytesRecv, a.rttSumUs, a.rttCount, a.rttMaxUs,
-			activeSnapshot[k.edgeID],
+			activeEnd, lastBucket,
 		); err != nil {
-			return err
+			return 0, err
 		}
 	}
 
+	var version uint64
 	if s.graph != nil {
-		if err := s.flushMeta(tx, now, lastBucket, span); err != nil {
-			return err
+		if version, err = s.flushMeta(tx, now, lastBucket, span); err != nil {
+			return 0, err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return version, nil
 }
 
-func (s *Store) flushMeta(tx *sql.Tx, now time.Time, bucket, span int64) error {
+func (s *Store) flushMeta(tx *sql.Tx, now time.Time, bucket, span int64) (uint64, error) {
 	snap := s.graph.Snapshot()
 
 	s.mu.Lock()
+	// metaVersion is only advanced by the caller after a successful
+	// commit; comparing here just decides whether upserts can be
+	// skipped.
 	sameVersion := snap.Version == s.metaVersion && snap.Version != 0
-	s.metaVersion = snap.Version
 	s.mu.Unlock()
 
 	bucketStart := time.Unix(bucket, 0)
@@ -359,7 +426,7 @@ ON CONFLICT(id) DO UPDATE SET
 				string(ports), string(addrs), string(pids),
 				n.FirstSeen.Unix(), n.LastSeen.Unix(),
 			); err != nil {
-				return err
+				return 0, err
 			}
 		}
 		// Presence: node was seen during (or after) the flushed bucket.
@@ -380,7 +447,7 @@ ON CONFLICT(node_id, bucket, span) DO UPDATE SET
   listen_ports=CASE WHEN excluded.listening > 0 THEN excluded.listen_ports ELSE listen_ports END`,
 				n.ID, bucket, span, listening, portsJSON,
 			); err != nil {
-				return err
+				return 0, err
 			}
 		}
 	}
@@ -394,16 +461,24 @@ ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen`,
 				e.ID, e.Src, e.Dst, e.DstPort, e.Protocol,
 				e.FirstSeen.Unix(), e.LastSeen.Unix(),
 			); err != nil {
-				return err
+				return 0, err
 			}
 		}
 	}
 	_ = now
-	return nil
+	return snap.Version, nil
+}
+
+// FinalFlush persists everything including the still-open bucket. Call
+// once at shutdown, before Close.
+func (s *Store) FinalFlush() error {
+	return s.Flush(time.Now().Add(s.fineSpan))
 }
 
 // Run flushes on the fine-span cadence and applies retention hourly
 // until ctx is done. Errors are delivered to onError (may be nil).
+// The caller owns the shutdown flush (FinalFlush) so it cannot race
+// process exit.
 func (s *Store) Run(ctx context.Context, onError func(error)) {
 	flush := time.NewTicker(s.fineSpan)
 	defer flush.Stop()
@@ -418,7 +493,6 @@ func (s *Store) Run(ctx context.Context, onError func(error)) {
 	for {
 		select {
 		case <-ctx.Done():
-			report(s.Flush(time.Now().Add(s.fineSpan))) // final flush incl. open bucket
 			return
 		case now := <-flush.C:
 			report(s.Flush(now))

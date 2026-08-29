@@ -74,7 +74,7 @@ from these attach points: per-request latency (needs L7 parsing),
 mid-life throughput of open connections (no per-ACK sampling in v0.2),
 UDP anything.
 
-Events (96-byte fixed struct, little-endian) stream over a 512 KiB ring
+Events (104-byte fixed struct, little-endian) stream over a 1 MiB ring
 buffer; a per-CPU counter records drops, exposed at `/api/meta`. The
 programs never read packet payloads — only connection metadata.
 
@@ -163,9 +163,12 @@ list of well-known infrastructure; anything unknown stays visible),
 external endpoints collapsed into one aggregate, Atlas recognizing its
 own executable. **Compare** projects two reconstructions and diffs them
 deterministically: added/removed nodes and edges, plus edges whose
-health moved by ≥50 % *and* past an absolute floor (5 ms RTT, 5
-connections, 64 KiB, any new failures/resets). The thresholds are code,
-not heuristics-by-vibes: the same inputs always produce the same diff.
+health moved meaningfully: failures or resets appearing where there
+were none, or any counter moving by ≥50 % *and* past an absolute floor
+(5 ms RTT, 5 connections, 64 KiB bytes, 3 retransmits, 1
+failure/reset). The thresholds are code, not heuristics-by-vibes: the
+same inputs always produce the same diff, and reversed timestamps are
+normalized so A is always the earlier moment.
 
 `internal/api` serves `GET /api/graph[?at=]`, `GET /api/appview[?at=]`,
 `GET /api/compare?a=&b=`, `GET /api/timeline?from=&to=&step=`,
@@ -210,7 +213,11 @@ straight from `/api/compare` output. There is no inference layer.
   but not throughput until teardown.
 - Node metadata other than listen ports (labels, images, pids) is
   "latest known", not versioned: a renamed container replays under its
-  current name. Listen ports are era-accurate.
+  current name. Listen ports are era-accurate (at 5-minute granularity
+  once fine buckets have been compacted).
+- Event timestamps map CLOCK_MONOTONIC to wall time using an offset
+  captured at agent start; a suspend/resume or a large NTP step skews
+  the mapping until the agent restarts.
 - Replay resolution is the bucket span: 10 s for the last 2 hours, 5 min
   beyond, nothing past 7 days (defaults).
 - Reset counts cover RSTs received by local sockets only.
@@ -225,7 +232,7 @@ straight from `/api/compare` output. There is no inference layer.
   the kernel-provided comm is kept as fallback identity.
 - Connections established before the agent started are invisible until
   they close (no state transition to observe). A `/proc/net` seed scan
-  at startup is the obvious v0.2 fix and slots into the collector
+  at startup is the obvious next step and slots into the collector
   without schema changes.
 - Tracking state is capped by a 1-hour idle TTL. An established
   connection produces no events while it lives, so a connection

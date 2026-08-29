@@ -115,7 +115,9 @@ function NodeDetails({
   const outgoing = graph.edges.filter((e) => e.src === node.id);
   const incoming = graph.edges.filter((e) => e.dst === node.id);
   const nodesById = new Map(graph.nodes.map((n) => [n.id, n]));
-  const changes = useRecentChanges(node.id, mode);
+  // The compare endpoint speaks service ids, so the digest only makes
+  // sense in the services view.
+  const changes = useRecentChanges(node.id, mode, !rawView);
 
   const raw = node.raw;
   const app = node.app;
@@ -265,12 +267,16 @@ interface ChangeLine {
   tone: "add" | "remove" | "warn";
 }
 
-/** In live mode, a small deterministic "what changed recently" digest
- * for the selected node, computed by the compare endpoint. */
-function useRecentChanges(nodeID: string, mode: TimeMode): ChangeLine[] | null {
+/** In live services view, a small deterministic "what changed recently"
+ * digest for the selected node, computed by the compare endpoint. */
+function useRecentChanges(
+  nodeID: string,
+  mode: TimeMode,
+  enabled: boolean,
+): ChangeLine[] | null {
   const [lines, setLines] = useState<ChangeLine[] | null>(null);
   useEffect(() => {
-    if (mode.kind !== "live") {
+    if (mode.kind !== "live" || !enabled) {
       setLines(null);
       return;
     }
@@ -280,20 +286,25 @@ function useRecentChanges(nodeID: string, mode: TimeMode): ChangeLine[] | null {
       .then((d) => {
         if (stopped) return;
         const out: ChangeLine[] = [];
-        const touches = (id: string, src: string, dst: string) =>
-          id === nodeID || src === nodeID || dst === nodeID;
+        const touches = (src: string, dst: string) =>
+          src === nodeID || dst === nodeID;
+        for (const n of d.addedNodes ?? []) {
+          if (n.id === nodeID) {
+            out.push({ text: "+ appeared in this window", tone: "add" });
+          }
+        }
         for (const e of d.addedEdges ?? []) {
-          if (touches("", e.src, e.dst)) {
+          if (touches(e.src, e.dst)) {
             out.push({ text: `+ edge → :${e.dstPort}`, tone: "add" });
           }
         }
         for (const e of d.removedEdges ?? []) {
-          if (touches("", e.src, e.dst)) {
+          if (touches(e.src, e.dst)) {
             out.push({ text: `− edge → :${e.dstPort}`, tone: "remove" });
           }
         }
         for (const c of d.changedEdges ?? []) {
-          if (touches("", c.edge.src, c.edge.dst)) {
+          if (touches(c.edge.src, c.edge.dst)) {
             out.push({
               text: `~ :${c.edge.dstPort} ${c.changes.join(", ")}`,
               tone: "warn",
@@ -306,7 +317,7 @@ function useRecentChanges(nodeID: string, mode: TimeMode): ChangeLine[] | null {
     return () => {
       stopped = true;
     };
-  }, [nodeID, mode.kind]);
+  }, [nodeID, mode.kind, enabled]);
   return lines;
 }
 

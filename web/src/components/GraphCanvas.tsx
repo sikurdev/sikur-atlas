@@ -71,12 +71,12 @@ export function GraphCanvas({
     return () => sim.stop();
   }, [sim]);
 
+  // The sim is kept in sync in every layout mode, so switching back to
+  // explore never paints a frame of stale nodes.
   useEffect(() => {
-    if (layout === "explore") {
-      sim.update(graph);
-      setFrame((f) => f + 1);
-    }
-  }, [graph, sim, layout]);
+    sim.update(graph);
+    setFrame((f) => f + 1);
+  }, [graph, sim]);
 
   const layered = useMemo<Map<string, Position>>(
     () => (layout === "overview" ? layeredLayout(graph) : new Map()),
@@ -101,7 +101,7 @@ export function GraphCanvas({
       if (layout === "overview") {
         return layered.get(id) ?? null;
       }
-      const n = sim.nodes().find((sn) => sn.id === id);
+      const n = sim.byId(id);
       if (!n || n.x == null || n.y == null) return null;
       return { x: n.x, y: n.y };
     },

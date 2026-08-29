@@ -33,11 +33,14 @@ func (s *Store) SnapshotAt(t time.Time, presence, metric time.Duration) (graph.S
 	}
 	aggs := make(map[string]*edgeAgg)
 
+	// bucket < t (strict): a bucket starting exactly at t lies entirely
+	// in t's future. A bucket straddling t contributes whole — replay
+	// resolution equals the bucket span, as documented.
 	rows, err := s.db.Query(`
 SELECT edge_id, bucket, span, opens, closes, failures, resets, retrans,
        bytes_sent, bytes_recv, rtt_sum_us, rtt_count, rtt_max_us, active_end
 FROM edge_buckets
-WHERE bucket + span > ? AND bucket <= ?
+WHERE bucket + span > ? AND bucket < ?
 ORDER BY bucket`, presFrom, tU)
 	if err != nil {
 		return graph.Snapshot{}, err
@@ -88,7 +91,7 @@ ORDER BY bucket`, presFrom, tU)
 	prows, err := s.db.Query(`
 SELECT node_id, bucket, span, listening, listen_ports
 FROM node_presence
-WHERE bucket + span > ? AND bucket <= ?
+WHERE bucket + span > ? AND bucket < ?
 ORDER BY bucket`, presFrom, tU)
 	if err != nil {
 		return graph.Snapshot{}, err
@@ -247,8 +250,11 @@ type TimelineBucket struct {
 }
 
 // Timeline aggregates activity between from and to into step-sized
-// buckets, merging in-memory (unflushed) buckets so the right edge of
-// the timeline is current.
+// buckets, merging in-memory (unflushed and in-flight) buckets so the
+// right edge of the timeline is current. A stored bucket overlapping the
+// range is counted whole on the step containing its (clamped) start —
+// sub-span distribution is not attempted, so timeline resolution equals
+// the stored span.
 func (s *Store) Timeline(from, to time.Time, step time.Duration) ([]TimelineBucket, error) {
 	if step < s.fineSpan {
 		step = s.fineSpan
@@ -256,47 +262,60 @@ func (s *Store) Timeline(from, to time.Time, step time.Duration) ([]TimelineBuck
 	stepS := int64(step.Seconds())
 	fromU := from.Unix() / stepS * stepS
 	toU := to.Unix()
+	if toU < fromU {
+		return nil, nil
+	}
 
 	out := make(map[int64]*TimelineBucket)
+	fold := func(bucket int64, opens, closes, failures, trouble uint64) {
+		start := bucket
+		if start < fromU {
+			start = fromU
+		}
+		start = start / stepS * stepS
+		b, ok := out[start]
+		if !ok {
+			b = &TimelineBucket{Start: start}
+			out[start] = b
+		}
+		b.Opens += opens
+		b.Closes += closes
+		b.Failures += failures
+		b.Trouble += trouble
+	}
+
 	rows, err := s.db.Query(`
-SELECT (bucket / ?) * ?, SUM(opens), SUM(closes), SUM(failures), SUM(resets + retrans)
+SELECT bucket, opens, closes, failures, resets + retrans
 FROM edge_buckets
-WHERE bucket >= ? AND bucket <= ?
-GROUP BY 1`, stepS, stepS, fromU, toU)
+WHERE bucket + span > ? AND bucket <= ?`, fromU, toU)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var b TimelineBucket
-		if err := rows.Scan(&b.Start, &b.Opens, &b.Closes, &b.Failures, &b.Trouble); err != nil {
+		var bucket int64
+		var opens, closes, failures, trouble uint64
+		if err := rows.Scan(&bucket, &opens, &closes, &failures, &trouble); err != nil {
 			return nil, err
 		}
-		out[b.Start] = &b
+		fold(bucket, opens, closes, failures, trouble)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
 	s.mu.Lock()
-	for k, a := range s.buckets {
-		if k.start < fromU || k.start > toU {
-			continue
+	for _, m := range []map[bucketKey]*acc{s.buckets, s.flushing} {
+		for k, a := range m {
+			if k.start+int64(s.fineSpan.Seconds()) <= fromU || k.start > toU {
+				continue
+			}
+			fold(k.start, a.opens, a.closes, a.failures, a.resets+a.retrans)
 		}
-		start := k.start / stepS * stepS
-		b, ok := out[start]
-		if !ok {
-			b = &TimelineBucket{Start: start}
-			out[start] = b
-		}
-		b.Opens += a.opens
-		b.Closes += a.closes
-		b.Failures += a.failures
-		b.Trouble += a.resets + a.retrans
 	}
 	s.mu.Unlock()
 
-	series := make([]TimelineBucket, 0, len(out))
+	series := make([]TimelineBucket, 0, (toU-fromU)/stepS+1)
 	for start := fromU; start <= toU; start += stepS {
 		if b, ok := out[start]; ok {
 			series = append(series, *b)
@@ -366,22 +385,24 @@ FROM edge_buckets WHERE bucket + span > ?`, from)
 	}
 
 	s.mu.Lock()
-	for k, a := range s.buckets {
-		if k.start+int64(s.fineSpan.Seconds()) <= from {
-			continue
-		}
-		v := get(k.edgeID)
-		v.w.Opens += a.opens
-		v.w.Closes += a.closes
-		v.w.Failures += a.failures
-		v.w.Resets += a.resets
-		v.w.Retransmits += a.retrans
-		v.w.BytesSent += a.bytesSent
-		v.w.BytesRecv += a.bytesRecv
-		v.rttSum += a.rttSumUs
-		v.rttCount += a.rttCount
-		if a.rttMaxUs > v.w.RTTMaxUs {
-			v.w.RTTMaxUs = a.rttMaxUs
+	for _, m := range []map[bucketKey]*acc{s.buckets, s.flushing} {
+		for k, a := range m {
+			if k.start+int64(s.fineSpan.Seconds()) <= from {
+				continue
+			}
+			v := get(k.edgeID)
+			v.w.Opens += a.opens
+			v.w.Closes += a.closes
+			v.w.Failures += a.failures
+			v.w.Resets += a.resets
+			v.w.Retransmits += a.retrans
+			v.w.BytesSent += a.bytesSent
+			v.w.BytesRecv += a.bytesRecv
+			v.rttSum += a.rttSumUs
+			v.rttCount += a.rttCount
+			if a.rttMaxUs > v.w.RTTMaxUs {
+				v.w.RTTMaxUs = a.rttMaxUs
+			}
 		}
 	}
 	active := make(map[string]int64, len(s.active))
@@ -491,15 +512,57 @@ ON CONFLICT(edge_id, bucket, span) DO UPDATE SET
 		return err
 	}
 
-	// Node presence: coarse rows keep the listening flag ORed.
-	if _, err := tx.Exec(`
-INSERT INTO node_presence (node_id, bucket, span, listening)
-SELECT node_id, (bucket / ?) * ?, ?, MAX(listening)
-FROM node_presence WHERE span = ? AND bucket < ?
-GROUP BY node_id, (bucket / ?) * ?
-ON CONFLICT(node_id, bucket, span) DO UPDATE SET listening=MAX(listening, excluded.listening)`,
-		coarseS, coarseS, coarseS, fineS, fineCutoff, coarseS, coarseS); err != nil {
+	// Node presence: aggregated in Go so the per-era listen ports of the
+	// latest listening fine row survive into the coarse row.
+	type presAcc struct {
+		listening  int
+		ports      string
+		lastBucket int64
+	}
+	prows, err := tx.Query(`
+SELECT node_id, bucket, listening, listen_ports
+FROM node_presence WHERE span = ? AND bucket < ? ORDER BY bucket`, fineS, fineCutoff)
+	if err != nil {
 		return err
+	}
+	pres := make(map[bucketKey]*presAcc)
+	for prows.Next() {
+		var id, ports string
+		var bucket int64
+		var listening int
+		if err := prows.Scan(&id, &bucket, &listening, &ports); err != nil {
+			prows.Close()
+			return err
+		}
+		k := bucketKey{edgeID: id, start: bucket / coarseS * coarseS}
+		p, ok := pres[k]
+		if !ok {
+			p = &presAcc{}
+			pres[k] = p
+		}
+		if listening > p.listening {
+			p.listening = listening
+		}
+		if listening > 0 && ports != "" && bucket >= p.lastBucket {
+			p.ports = ports
+			p.lastBucket = bucket
+		}
+	}
+	prows.Close()
+	if err := prows.Err(); err != nil {
+		return err
+	}
+	for k, p := range pres {
+		if _, err := tx.Exec(`
+INSERT INTO node_presence (node_id, bucket, span, listening, listen_ports)
+VALUES (?,?,?,?,?)
+ON CONFLICT(node_id, bucket, span) DO UPDATE SET
+  listening=MAX(listening, excluded.listening),
+  listen_ports=CASE WHEN excluded.listening > 0 AND excluded.listen_ports != ''
+                    THEN excluded.listen_ports ELSE listen_ports END`,
+			k.edgeID, k.start, coarseS, p.listening, p.ports); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec(`DELETE FROM node_presence WHERE span = ? AND bucket < ?`, fineS, fineCutoff); err != nil {
 		return err

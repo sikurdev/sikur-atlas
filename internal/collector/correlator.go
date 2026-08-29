@@ -243,12 +243,32 @@ func (c *Correlator) handleOpen(ev model.ConnEvent) {
 	// yet, so the tuple is not trusted until EventEstablished; the
 	// destination is, and is kept for failure attribution.
 	st := c.sock(ev.SockID, ev.Time)
+	// A fresh connect on a known socket address means the kernel reused
+	// it after a close we never saw: shed every trace of the old
+	// connection so nothing leaks into (or out of) the new one.
+	c.detachSock(st, ev.Time)
 	st.dir = dirOutbound
 	st.pid = ev.PID
 	st.comm = ev.Comm
 	st.dst = ev.Dst
+	st.established = false
 	st.preRetrans = 0
 	st.preResets = 0
+}
+
+// detachSock releases a socket's link to its connection record,
+// dropping the record when this was its last reference.
+func (c *Correlator) detachSock(st *sockState, at time.Time) {
+	if !st.hasKey {
+		return
+	}
+	if old, ok := c.records[st.key]; ok {
+		old.sockRefs--
+		if old.sockRefs <= 0 {
+			c.dropRecord(st.key, old, at)
+		}
+	}
+	st.hasKey = false
 }
 
 type healthKind int
@@ -269,6 +289,11 @@ func (c *Correlator) handleHealthEvent(ev model.ConnEvent, kind healthKind) {
 	var rec *connRecord
 	if st.hasKey {
 		rec = c.records[st.key]
+	}
+	if rec != nil {
+		// A retransmitting connection is alive: keep it from being
+		// idle-swept while it degrades.
+		rec.lastTouch = ev.Time
 	}
 	if rec == nil || !rec.materialized {
 		switch {
@@ -299,12 +324,13 @@ func (c *Correlator) handleHealthEvent(ev model.ConnEvent, kind healthKind) {
 
 func (c *Correlator) handleAccept(ev model.ConnEvent) {
 	st := c.sock(ev.SockID, ev.Time)
+	// Identity is assigned after attachSock so its reuse-reset cannot
+	// wipe these fresh values.
+	key := canonKey(ev.Src, ev.Dst)
+	rec := c.attachSock(st, key, ev.Time)
 	st.dir = dirInbound
 	st.pid = ev.PID
 	st.comm = ev.Comm
-
-	key := canonKey(ev.Src, ev.Dst)
-	rec := c.attachSock(st, key, ev.Time)
 	rec.server = ev.Src // local end of the accepted socket
 	rec.client = ev.Dst
 	rec.oriented = true
@@ -386,17 +412,16 @@ func (c *Correlator) handleClose(ev model.ConnEvent) {
 	}
 
 	if !rec.materialized {
-		if rec.sockRefs > 0 {
-			// The twin socket is still live and may yet identify itself
-			// (accept can trail the client's close). Stash and wait for
-			// the twin or the grace deadline.
-			if rec.pending == nil {
-				rec.pending = &pc
-			}
-			return
+		// Wait for the other half to identify itself (accept can trail
+		// the client's close, and the server's establish event can be
+		// lost) or for the grace deadline; Tick materializes, applies
+		// the stash and cleans up. Forcing materialization here would
+		// commit to endpoints that better evidence may contradict
+		// within the second.
+		if rec.pending == nil {
+			rec.pending = &pc
 		}
-		// Nothing else is coming: attribute with what we have.
-		c.tryMaterialize(rec, ev.Time, true)
+		return
 	}
 
 	if rec.pending != nil {
@@ -446,6 +471,12 @@ func (c *Correlator) noteFailedConnect(st *sockState, ev model.ConnEvent) {
 	if st.dir != dirOutbound || !st.dst.IsValid() || st.dst.Addr().IsUnspecified() {
 		return
 	}
+	// Byte counters or an RTT estimate prove the handshake actually
+	// completed — we only missed the establish event (ring overflow).
+	// A real connection must not be reported as a failed connect.
+	if ev.BytesSent > 0 || ev.BytesRecv > 0 || ev.SRTTMicros > 0 {
+		return
+	}
 	c.stats.FailedConns++
 	info := c.resolver.Resolve(st.pid, st.comm)
 	clientSpec := c.specForProcess(info, "")
@@ -491,10 +522,10 @@ func (c *Correlator) Tick(now time.Time) {
 		if rec.materialized && rec.pending != nil {
 			c.applyClose(rec, *rec.pending)
 			rec.pending = nil
-			if rec.sockRefs <= 0 {
-				delete(c.records, key)
-				continue
-			}
+		}
+		if rec.materialized && rec.closed && rec.sockRefs <= 0 {
+			delete(c.records, key)
+			continue
 		}
 		if c.idleTTL > 0 && now.Sub(rec.lastTouch) > c.idleTTL {
 			c.dropRecord(key, rec, now)
@@ -576,15 +607,17 @@ func (c *Correlator) sock(id uint64, at time.Time) *sockState {
 func (c *Correlator) attachSock(st *sockState, key connKey, at time.Time) *connRecord {
 	if st.hasKey && st.key != key {
 		// The kernel reused a socket address whose close event we lost.
-		// Detach from the stale record before adopting the new identity,
-		// releasing its edge bookkeeping.
-		if old, ok := c.records[st.key]; ok {
-			old.sockRefs--
-			if old.sockRefs <= 0 {
-				c.dropRecord(st.key, old, at)
-			}
-		}
-		st.hasKey = false
+		// Detach from the stale record and reset the stale identity: a
+		// different tuple is a different connection, and inherited
+		// pid/comm/direction would misattribute it. Callers that know
+		// the real identity (accept) assign it after this call.
+		c.detachSock(st, at)
+		st.dir = dirUnknown
+		st.pid = 0
+		st.comm = ""
+		st.established = false
+		st.preRetrans = 0
+		st.preResets = 0
 	}
 	rec, ok := c.records[key]
 	if !ok {

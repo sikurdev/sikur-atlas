@@ -170,6 +170,10 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if !to.After(from) {
+		http.Error(w, "to must be after from", http.StatusBadRequest)
+		return
+	}
 	step := to.Sub(from) / 120
 	if v := q.Get("step"); v != "" {
 		secs, err := strconv.Atoi(v)
@@ -178,6 +182,15 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		step = time.Duration(secs) * time.Second
+	}
+	if step < time.Second {
+		step = time.Second
+	}
+	// Bound the response: a huge range with a tiny step would otherwise
+	// materialize millions of buckets.
+	if buckets := to.Sub(from) / step; buckets > 5000 {
+		http.Error(w, fmt.Sprintf("range/step yields %d buckets; max 5000", buckets), http.StatusBadRequest)
+		return
 	}
 	series, err := s.cfg.History.Timeline(from, to, step)
 	if err != nil {
@@ -201,6 +214,11 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 	if errA != nil || errB != nil {
 		http.Error(w, "compare needs a= and b= timestamps", http.StatusBadRequest)
 		return
+	}
+	// The diff's semantics are "A = earlier, B = later"; normalize so a
+	// reversed pin order cannot silently invert added/removed.
+	if a.After(b) {
+		a, b = b, a
 	}
 	presence, errP := parseSeconds(q.Get("presence"))
 	window, errW := parseSeconds(q.Get("window"))

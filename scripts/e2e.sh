@@ -91,14 +91,24 @@ echo "agent restarted"
 echo "== phase 3: history intact after restart =="
 node scripts/assert-lifecycle.mjs "$BASE_URL" "$T1" "$T2" "PHASE 3 (post-restart)"
 
-echo "== letting the restarted agent observe live traffic (20s) =="
-sleep 20
+echo "== letting the restarted agent observe live traffic (25s) =="
+sleep 25
 LIVE_EDGES=$(curl -fsS "$BASE_URL/api/appview" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);console.log(j.edges.filter(e=>e.src==='svc:compose:atlas-demo/gateway').length)})")
 if [ "$LIVE_EDGES" -lt 1 ]; then
     echo "restarted agent sees no live gateway traffic"
     exit 1
 fi
 echo "restarted agent is observing live traffic (gateway edges: $LIVE_EDGES)"
+
+echo "== phase 3b: the restarted agent RECORDS new history (not just reads old) =="
+T3=$(date +%s)
+POST_RESTART=$(curl -fsS "$BASE_URL/api/appview?at=$T3&presence=30" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);const e=j.edges.find(e=>e.src==='svc:compose:atlas-demo/gateway');console.log(e&&e.window&&e.window.opens>=1?'ok':'missing')})")
+if [ "$POST_RESTART" != "ok" ]; then
+    echo "post-restart era not present in history (replay at T3 shows no gateway activity)"
+    curl -fsS "$BASE_URL/api/appview?at=$T3&presence=30" || true
+    exit 1
+fi
+echo "post-restart era reconstructs from newly recorded history"
 
 if [ "${ATLAS_E2E_UI:-1}" != "0" ]; then
     echo "== UI end-to-end (headless chromium) =="

@@ -151,10 +151,13 @@ struct trace_event_raw_tcp_event_sk_skb {
 	const void *skaddr;
 } __attribute__((preserve_access_index));
 
-/* Tracepoint record for tcp:tcp_receive_reset (stable since 4.16).
- * Deliberately NOT tcp_send_reset: its record grew a `reason` field in
- * 6.10 which shifts offsets between kernel versions. */
-struct trace_event_raw_tcp_receive_reset {
+/* Tracepoint record class for tcp:tcp_receive_reset. The event is a
+ * DEFINE_EVENT of DECLARE_EVENT_CLASS(tcp_event_sk), and kernel BTF only
+ * carries raw-record structs per CLASS — there is no
+ * trace_event_raw_tcp_receive_reset type. Deliberately NOT
+ * tcp_send_reset: its record grew a `reason` field in 6.10 which shifts
+ * offsets between kernel versions. */
+struct trace_event_raw_tcp_event_sk {
 	struct trace_entry ent;
 	const void *skaddr;
 } __attribute__((preserve_access_index));

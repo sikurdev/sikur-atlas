@@ -271,6 +271,120 @@ func TestCompactPreservesHistory(t *testing.T) {
 	}
 }
 
+// Compaction must carry per-era listen ports into the coarse presence
+// rows — Replay of old eras keeps showing what was listening then.
+func TestCompactPreservesListenPorts(t *testing.T) {
+	g := seedGraph()
+	s := openTest(t, g) // fine 10s, coarse 60s
+	id := edgeID()
+
+	s.EdgeOpened(id, t0)
+	if err := s.Flush(t0.Add(15 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	s.fineRetention = time.Minute
+	if err := s.Compact(t0.Add(10 * time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := s.SnapshotAt(t0.Add(30*time.Second), 2*time.Minute, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, n := range snap.Nodes {
+		if n.ID == "proc:/usr/sbin/nginx" {
+			found = true
+			if len(n.ListenPorts) != 1 || n.ListenPorts[0] != 8080 {
+				t.Fatalf("ports lost in compaction: %+v", n)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("nginx missing post-compaction: %+v", snap.Nodes)
+	}
+}
+
+// A failed flush must requeue the drained buckets instead of losing the
+// interval's telemetry.
+func TestFlushFailureRequeues(t *testing.T) {
+	g := seedGraph()
+	s := openTest(t, g)
+	id := edgeID()
+
+	s.EdgeOpened(id, t0)
+	s.EdgeFailure(id, t0.Add(time.Second))
+
+	// Sabotage the schema so the flush transaction fails, then restore.
+	if _, err := s.db.Exec(`ALTER TABLE edge_buckets RENAME TO edge_buckets_hidden`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(t0.Add(15 * time.Second)); err == nil {
+		t.Fatal("flush against a broken schema must error")
+	}
+	if _, err := s.db.Exec(`ALTER TABLE edge_buckets_hidden RENAME TO edge_buckets`); err != nil {
+		t.Fatal(err)
+	}
+
+	// While unflushed, the data must still be readable (staging/requeue).
+	health, err := s.WindowHealth(t0.Add(16*time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := health[id]; w.Opens != 1 || w.Failures != 1 {
+		t.Fatalf("requeued data invisible: %+v", w)
+	}
+
+	if err := s.Flush(t0.Add(25 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := s.SnapshotAt(t0.Add(30*time.Second), 2*time.Minute, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Edges) != 1 || snap.Edges[0].Window.Opens != 1 || snap.Edges[0].Window.Failures != 1 {
+		t.Fatalf("telemetry lost across failed flush: %+v", snap.Edges)
+	}
+}
+
+// An edge opened inside the still-open bucket must not get a keep-alive
+// presence row backdated into the previous bucket.
+func TestKeepAliveDoesNotBackdate(t *testing.T) {
+	g := seedGraph()
+	s := openTest(t, g)
+	id := edgeID()
+
+	// Open inside the CURRENT (unflushed at flush time) bucket: flush at
+	// t0+15s has cutoff t0+10s, so an open at t0+12s stays in memory.
+	s.EdgeOpened(id, t0.Add(12*time.Second))
+	if err := s.Flush(t0.Add(15 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM edge_buckets WHERE bucket < ?`,
+		t0.Add(10*time.Second).Unix(),
+	).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("edge backdated into a bucket before it existed: %d rows", n)
+	}
+
+	// The next flush persists it in its true bucket.
+	if err := s.Flush(t0.Add(25 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := s.SnapshotAt(t0.Add(26*time.Second), 2*time.Minute, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Edges) != 1 || snap.Edges[0].ActiveConns != 1 {
+		t.Fatalf("open edge lost: %+v", snap.Edges)
+	}
+}
+
 // A stale listen port must not be presented as current in a window where
 // the node was not observed listening.
 func TestReplayHidesStaleListenPorts(t *testing.T) {

@@ -460,6 +460,8 @@ func TestSockAddressReuseAfterLostClose(t *testing.T) {
 	closeEv := ev(model.EventClose, 1, 0, "", newCli, newSrv, 6000)
 	closeEv.BytesSent, closeEv.BytesRecv = 700, 70
 	c.HandleEvent(closeEv)
+	// The close is stashed until the grace deadline resolves endpoints.
+	c.Tick(base.Add(10 * time.Second))
 
 	snap := store.Snapshot()
 	for _, e := range snap.Edges {
@@ -479,11 +481,171 @@ func TestSockAddressReuseAfterLostClose(t *testing.T) {
 		if e.DstPort == 9090 {
 			found = true
 		}
+		if e.ID == oldEdge.ID && e.ActiveConns != 0 {
+			t.Fatalf("stale edge's active count not released: %+v", e)
+		}
 	}
 	if !found {
 		t.Fatalf("new connection's edge missing: %+v", snap.Edges)
 	}
 	if c.Stats().LiveRecords != 0 || c.Stats().LiveSockets != 0 {
 		t.Fatalf("state leaked: %+v", c.Stats())
+	}
+}
+
+// A close carrying byte counters proves the handshake happened even if
+// the establish event was lost — it must not count as a failed connect.
+func TestDroppedEstablishIsNotAFailure(t *testing.T) {
+	res := fakeResolver{100: {PID: 100, Comm: "curl", Exe: "/usr/bin/curl"}}
+	c, store := newTestCorrelator(res)
+
+	c.HandleEvent(ev(model.EventOpen, 1, 100, "curl", netip.AddrPort{}, ap("10.0.0.9", 443), 0))
+	closeEv := ev(model.EventClose, 1, 0, "", ap("10.0.0.5", 50000), ap("10.0.0.9", 443), 5000)
+	closeEv.BytesSent, closeEv.BytesRecv = 900, 4000
+	closeEv.SRTTMicros = 1200
+	c.HandleEvent(closeEv)
+
+	snap := store.Snapshot()
+	for _, e := range snap.Edges {
+		if e.Failures > 0 {
+			t.Fatalf("established connection reported as failure: %+v", e)
+		}
+	}
+	if c.Stats().FailedConns != 0 {
+		t.Fatalf("failedConns = %d, want 0", c.Stats().FailedConns)
+	}
+}
+
+// The server's establish event is lost AND accept trails the client's
+// close: the stash must survive until accept identifies the server, and
+// the connection must count exactly once.
+func TestAcceptAfterCloseWithLostServerEstablish(t *testing.T) {
+	res := fakeResolver{
+		100: {PID: 100, Comm: "curl", Exe: "/usr/bin/curl"},
+		200: {PID: 200, Comm: "nginx", Exe: "/usr/sbin/nginx"},
+	}
+	c, store := newTestCorrelator(res)
+
+	cli := ap("127.0.0.1", 41000)
+	srv := ap("127.0.0.1", 8080)
+	c.HandleEvent(ev(model.EventOpen, 1, 100, "curl", netip.AddrPort{}, srv, 0))
+	c.HandleEvent(ev(model.EventEstablished, 1, 0, "", cli, srv, 1))
+	// Server-side EventEstablished for sock 2 lost to ring overflow.
+	closeEv := ev(model.EventClose, 1, 0, "", cli, srv, 10)
+	closeEv.BytesSent, closeEv.BytesRecv = 300, 900
+	c.HandleEvent(closeEv)
+
+	if n := len(store.Snapshot().Edges); n != 0 {
+		t.Fatalf("edge materialized before the server identified itself: %d", n)
+	}
+
+	c.HandleEvent(ev(model.EventAccept, 2, 200, "nginx", srv, cli, 20))
+	snap := store.Snapshot()
+	if len(snap.Edges) != 1 {
+		t.Fatalf("edges = %d, want exactly 1 (no double count)", len(snap.Edges))
+	}
+	e := snap.Edges[0]
+	if e.Dst != "proc:/usr/sbin/nginx" || e.Connections != 1 || e.ActiveConns != 0 {
+		t.Fatalf("edge = %+v", e)
+	}
+	if e.BytesSent != 300 || e.BytesRecv != 900 {
+		t.Fatalf("bytes = %d/%d", e.BytesSent, e.BytesRecv)
+	}
+
+	// The server socket's own close cleans up without another count.
+	c.HandleEvent(ev(model.EventClose, 2, 0, "", srv, cli, 30))
+	c.Tick(base.Add(10 * time.Second))
+	snap = store.Snapshot()
+	if snap.Edges[0].Connections != 1 {
+		t.Fatalf("double counted: %+v", snap.Edges[0])
+	}
+	if st := c.Stats(); st.LiveRecords != 0 || st.LiveSockets != 0 {
+		t.Fatalf("state leaked: %+v", st)
+	}
+}
+
+// fakeRecorder captures Recorder calls for pairing verification.
+type fakeRecorder struct {
+	opened, closed, expired int
+	failures                int
+	retrans, resets         uint64
+	rtts                    []uint32
+}
+
+func (r *fakeRecorder) EdgeOpened(string, time.Time) { r.opened++ }
+func (r *fakeRecorder) EdgeClosed(_ string, _, _ uint64, rtt uint32, _ time.Time) {
+	r.closed++
+	if rtt > 0 {
+		r.rtts = append(r.rtts, rtt)
+	}
+}
+func (r *fakeRecorder) EdgeExpired(string, time.Time)               { r.expired++ }
+func (r *fakeRecorder) EdgeFailure(string, time.Time)               { r.failures++ }
+func (r *fakeRecorder) EdgeResets(_ string, n uint64, _ time.Time)  { r.resets += n }
+func (r *fakeRecorder) EdgeRetrans(_ string, n uint64, _ time.Time) { r.retrans += n }
+func (r *fakeRecorder) EdgeRTT(_ string, rtt uint32, _ time.Time) {
+	if rtt > 0 {
+		r.rtts = append(r.rtts, rtt)
+	}
+}
+
+// Every EdgeOpened must be balanced by exactly one EdgeClosed or
+// EdgeExpired, across normal closes, lost closes (idle sweep) and
+// socket-address reuse — otherwise history's active counts drift.
+func TestRecorderPairing(t *testing.T) {
+	res := fakeResolver{
+		100: {PID: 100, Comm: "curl", Exe: "/usr/bin/curl"},
+		200: {PID: 200, Comm: "nginx", Exe: "/usr/sbin/nginx"},
+	}
+	rec := &fakeRecorder{}
+	store := graph.NewStore()
+	c := New(store, res,
+		WithGracePeriod(time.Second),
+		WithIdleTTL(time.Minute),
+		WithRecorder(rec))
+
+	cli := ap("127.0.0.1", 41000)
+	srv := ap("127.0.0.1", 8080)
+
+	// 1: clean loopback connection, both halves close.
+	c.HandleEvent(ev(model.EventOpen, 1, 100, "curl", netip.AddrPort{}, srv, 0))
+	c.HandleEvent(ev(model.EventEstablished, 1, 0, "", cli, srv, 1))
+	c.HandleEvent(ev(model.EventAccept, 2, 200, "nginx", srv, cli, 2))
+	c.HandleEvent(ev(model.EventRetrans, 1, 0, "", netip.AddrPort{}, netip.AddrPort{}, 3))
+	closeEv := ev(model.EventClose, 1, 0, "", cli, srv, 500)
+	closeEv.BytesSent, closeEv.BytesRecv, closeEv.SRTTMicros = 500, 1000, 800
+	c.HandleEvent(closeEv)
+	c.HandleEvent(ev(model.EventClose, 2, 0, "", srv, cli, 501))
+
+	// 2: connection whose close is lost; swept by the idle TTL.
+	cli2 := ap("127.0.0.1", 41001)
+	c.HandleEvent(ev(model.EventOpen, 3, 100, "curl", netip.AddrPort{}, srv, 1000))
+	c.HandleEvent(ev(model.EventEstablished, 3, 0, "", cli2, srv, 1001))
+	c.Tick(base.Add(3 * time.Second)) // materializes towards ext/nginx
+	c.Tick(base.Add(3 * time.Minute)) // idle sweep
+
+	// 3: failed connect with a pre-establishment reset.
+	c.HandleEvent(ev(model.EventOpen, 5, 100, "curl", netip.AddrPort{}, ap("10.9.9.9", 81), 200_000))
+	c.HandleEvent(ev(model.EventReset, 5, 0, "", netip.AddrPort{}, netip.AddrPort{}, 200_001))
+	c.HandleEvent(ev(model.EventClose, 5, 0, "", netip.AddrPort{}, ap("10.9.9.9", 81), 200_002))
+
+	if rec.opened != 2 {
+		t.Fatalf("opened = %d, want 2", rec.opened)
+	}
+	if rec.closed+rec.expired != rec.opened {
+		t.Fatalf("pairing broken: opened=%d closed=%d expired=%d",
+			rec.opened, rec.closed, rec.expired)
+	}
+	if rec.expired != 1 {
+		t.Fatalf("expired = %d, want 1 (the swept connection)", rec.expired)
+	}
+	if rec.failures != 1 {
+		t.Fatalf("failures = %d, want 1", rec.failures)
+	}
+	if rec.retrans != 1 || rec.resets != 1 {
+		t.Fatalf("health routing: retrans=%d resets=%d, want 1/1", rec.retrans, rec.resets)
+	}
+	if len(rec.rtts) == 0 {
+		t.Fatalf("no RTT samples recorded")
 	}
 }

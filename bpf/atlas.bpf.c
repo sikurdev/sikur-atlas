@@ -67,7 +67,10 @@ const struct conn_event *conn_event_btf __attribute__((unused));
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 1 << 19); /* 512 KiB */
+	/* 1 MiB: retransmit events are emitted per segment, so a lossy host
+	 * shares this ring between health and lifecycle events. Overflow
+	 * drops are counted, never blocking. */
+	__uint(max_entries, 1 << 20);
 } events SEC(".maps");
 
 struct {
@@ -193,7 +196,7 @@ int atlas_tcp_retransmit(struct trace_event_raw_tcp_event_sk_skb *ctx)
  * from this host's perspective; RSTs we send to remote peers are not
  * counted — see docs/architecture.md). */
 SEC("tracepoint/tcp/tcp_receive_reset")
-int atlas_tcp_receive_reset(struct trace_event_raw_tcp_receive_reset *ctx)
+int atlas_tcp_receive_reset(struct trace_event_raw_tcp_event_sk *ctx)
 {
 	struct conn_event *e = reserve_event(ATLAS_EV_RST_RECV);
 
