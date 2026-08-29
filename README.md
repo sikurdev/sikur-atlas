@@ -13,7 +13,8 @@ container, groups containers into their Compose services, and records
 everything into a local SQLite file so the topology has a past, not just
 a present.
 
-![Atlas UI showing the demo topology](docs/atlas-ui.png)
+![Atlas live view: the demo topology mid-incident, with a failing
+dependency in red](docs/atlas-ui.png)
 
 ## Quick start
 
@@ -57,6 +58,9 @@ docker compose -f demo/docker-compose.yml stop inventory
 #   - "Pin A" on a past moment, pick a present moment: Compare lists
 #     "− inventory" and "− orders → inventory:8000"
 ```
+
+![Compare: inventory removed between the two moments, with the cascade
+it caused](docs/atlas-compare.png)
 
 `make demo-down` removes the workload. `make e2e` runs this whole story
 non-interactively — including a real service stop, an agent restart to
