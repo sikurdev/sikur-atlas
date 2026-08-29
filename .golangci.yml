@@ -13,6 +13,9 @@ linters:
         - (net/http.ResponseWriter).Write
         - (*github.com/cilium/ebpf/ringbuf.Reader).Close
         - (github.com/cilium/ebpf/link.Link).Close
+        - (*database/sql.Rows).Close
+        - (*database/sql.DB).Close
+        - (*github.com/sikurdev/sikur-atlas/internal/history.Store).Close
 
 formatters:
   enable:

@@ -1,4 +1,9 @@
-"""Demo users service: answers HTTP, touches the cache on every request."""
+"""Demo users service: answers HTTP, touches the cache on every request.
+
+It also attempts one connection per request to a deliberately wrong
+cache port (6380 — nothing listens there). The kernel refuses it with an
+RST, giving Atlas a live, honest failed-connection signal to display.
+"""
 import json
 import os
 import sys
@@ -8,10 +13,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rediswire
 
 CACHE_HOST = os.environ.get("CACHE_HOST", "cache")
+BROKEN_PORT = int(os.environ.get("BROKEN_CACHE_PORT", "6380"))
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        try:
+            rediswire.command(CACHE_HOST, "PING", port=BROKEN_PORT, timeout=0.5)
+        except OSError:
+            pass  # expected: connection refused
         try:
             rediswire.command(CACHE_HOST, "INCR", "users:served")
             served = rediswire.command(CACHE_HOST, "GET", "users:served")

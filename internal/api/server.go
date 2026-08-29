@@ -93,25 +93,45 @@ func (s *Server) liveSnapshot() graph.Snapshot {
 	return snap
 }
 
-// snapshotFor resolves the ?at= parameter: absent means live.
-func (s *Server) snapshotFor(r *http.Request) (graph.Snapshot, bool, error) {
-	atParam := r.URL.Query().Get("at")
+// snapshotFor resolves the ?at= parameter: absent means live. Optional
+// presence= and window= (seconds) tune the reconstruction windows.
+func (s *Server) snapshotFor(r *http.Request) (graph.Snapshot, error) {
+	q := r.URL.Query()
+	atParam := q.Get("at")
 	if atParam == "" {
-		return s.liveSnapshot(), true, nil
+		return s.liveSnapshot(), nil
 	}
 	if s.cfg.History == nil {
-		return graph.Snapshot{}, false, fmt.Errorf("history disabled")
+		return graph.Snapshot{}, fmt.Errorf("history disabled")
 	}
 	at, err := parseTime(atParam)
 	if err != nil {
-		return graph.Snapshot{}, false, err
+		return graph.Snapshot{}, err
 	}
-	snap, err := s.cfg.History.SnapshotAt(at, 0, 0)
-	return snap, false, err
+	presence, err := parseSeconds(q.Get("presence"))
+	if err != nil {
+		return graph.Snapshot{}, err
+	}
+	window, err := parseSeconds(q.Get("window"))
+	if err != nil {
+		return graph.Snapshot{}, err
+	}
+	return s.cfg.History.SnapshotAt(at, presence, window)
+}
+
+func parseSeconds(v string) (time.Duration, error) {
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("bad duration %q (want seconds)", v)
+	}
+	return time.Duration(n) * time.Second, nil
 }
 
 func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
-	snap, _, err := s.snapshotFor(r)
+	snap, err := s.snapshotFor(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -120,7 +140,7 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAppView(w http.ResponseWriter, r *http.Request) {
-	snap, _, err := s.snapshotFor(r)
+	snap, err := s.snapshotFor(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -182,12 +202,18 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "compare needs a= and b= timestamps", http.StatusBadRequest)
 		return
 	}
-	snapA, err := s.cfg.History.SnapshotAt(a, 0, 0)
+	presence, errP := parseSeconds(q.Get("presence"))
+	window, errW := parseSeconds(q.Get("window"))
+	if errP != nil || errW != nil {
+		http.Error(w, "bad presence/window", http.StatusBadRequest)
+		return
+	}
+	snapA, err := s.cfg.History.SnapshotAt(a, presence, window)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	snapB, err := s.cfg.History.SnapshotAt(b, 0, 0)
+	snapB, err := s.cfg.History.SnapshotAt(b, presence, window)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

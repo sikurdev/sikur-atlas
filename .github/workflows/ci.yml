@@ -56,10 +56,10 @@ jobs:
           ls -la /sys/kernel/btf/vmlinux
       - name: Run end-to-end demo
         run: make e2e
-      - name: Upload UI screenshot
+      - name: Upload UI screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: atlas-ui-screenshot
-          path: atlas-ui-e2e.png
+          name: atlas-ui-screenshots
+          path: atlas-ui-*.png
           if-no-files-found: ignore

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatAgo, formatBytes, formatCount, shortExe } from "./format";
+import { formatAgo, formatBytes, formatCount, formatRTT, shortExe } from "./format";
 
 describe("formatBytes", () => {
   it("formats across magnitudes", () => {
@@ -37,6 +37,15 @@ describe("formatCount", () => {
     expect(formatCount(1500)).toBe("1.5k");
     expect(formatCount(25000)).toBe("25k");
     expect(formatCount(3_400_000)).toBe("3.4M");
+  });
+});
+
+describe("formatRTT", () => {
+  it("scales units", () => {
+    expect(formatRTT(0)).toBe("–");
+    expect(formatRTT(850)).toBe("850 µs");
+    expect(formatRTT(2500)).toBe("2.5 ms");
+    expect(formatRTT(150000)).toBe("150 ms");
   });
 });
 

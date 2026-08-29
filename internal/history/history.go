@@ -46,11 +46,11 @@ type bucketKey struct {
 }
 
 type acc struct {
-	opens, closes, failures    uint64
-	resets, retrans            uint64
-	bytesSent, bytesRecv       uint64
-	rttSumUs, rttCount         uint64
-	rttMaxUs                   uint32
+	opens, closes, failures uint64
+	resets, retrans         uint64
+	bytesSent, bytesRecv    uint64
+	rttSumUs, rttCount      uint64
+	rttMaxUs                uint32
 }
 
 // Store owns the database and the in-memory accumulation state.
@@ -64,10 +64,10 @@ type Store struct {
 	fineRetention   time.Duration
 	coarseRetention time.Duration
 
-	mu           sync.Mutex
-	buckets      map[bucketKey]*acc
-	active       map[string]int64 // per-edge open connections
-	metaVersion  uint64           // last flushed graph version
+	mu          sync.Mutex
+	buckets     map[bucketKey]*acc
+	active      map[string]int64 // per-edge open connections
+	metaVersion uint64           // last flushed graph version
 }
 
 // Option configures a Store.

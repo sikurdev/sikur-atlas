@@ -42,6 +42,8 @@
   --water: #5b7fa6;
   --water-deep: #3d5e83;
   --accent: #c2347b;
+  /* Hazard red, used only for trouble: failures, resets, removals. */
+  --hazard: #a33b26;
 
   --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", monospace;
@@ -68,7 +70,7 @@ body {
 
 .app {
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto 1fr auto auto;
   height: 100%;
 }
 
@@ -140,6 +142,67 @@ body {
 
 .status.live .dot {
   background: var(--accent);
+}
+
+.status.replay .dot {
+  background: var(--ink-soft);
+  border-color: var(--ink-soft);
+}
+
+/* ---------- segmented controls ---------- */
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.seg button {
+  font-family: var(--sans);
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  background: var(--paper);
+  border: none;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+
+.seg button + button {
+  border-left: 1px solid var(--line);
+}
+
+.seg button.on {
+  color: var(--paper);
+  background: var(--ink);
+}
+
+.sys-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.pill {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.pill.on {
+  color: var(--paper);
+  background: var(--accent);
+  border-color: var(--accent);
 }
 
 .counts {
@@ -216,6 +279,21 @@ body {
   stroke-opacity: 0.12;
 }
 
+.edge.troubled {
+  stroke: var(--hazard);
+  stroke-opacity: 0.85;
+}
+
+.edge.diff-added {
+  stroke: var(--water-deep);
+  stroke-opacity: 1;
+}
+
+.edge.diff-removed {
+  stroke: var(--hazard);
+  stroke-opacity: 0.7;
+}
+
 .edge-hit {
   fill: none;
   stroke: transparent;
@@ -258,7 +336,61 @@ body {
 }
 
 .node.dimmed {
-  opacity: 0.25;
+  opacity: 0.18;
+}
+
+.node.cat-system .symbol,
+.node.cat-atlas .symbol {
+  stroke: var(--ink-soft);
+  stroke-dasharray: 1.5 2.5;
+}
+
+.node.cat-system,
+.node.cat-atlas {
+  opacity: 0.75;
+}
+
+.node .symbol-echo {
+  fill: var(--paper);
+  stroke: var(--line);
+  stroke-width: 1.5;
+}
+
+.node.kind-compose .symbol {
+  fill: var(--paper-inset);
+}
+
+.node.diff-removed .symbol {
+  stroke: var(--hazard);
+  stroke-dasharray: 3 3;
+}
+
+.node.diff-added .symbol {
+  stroke-width: 2.5;
+}
+
+.node .badge {
+  fill: var(--ink);
+}
+
+.node .badge-text {
+  font-family: var(--mono);
+  font-size: 10px;
+  fill: var(--paper);
+  text-anchor: middle;
+  stroke: none;
+}
+
+.node .diff-mark {
+  font-family: var(--mono);
+  font-size: 16px;
+  font-weight: 600;
+  fill: var(--water-deep);
+  stroke: none;
+}
+
+.node .diff-mark.removed {
+  fill: var(--hazard);
 }
 
 .node text {
@@ -376,6 +508,107 @@ body {
   font-size: 12.5px;
   line-height: 1.55;
   margin-top: 14px;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+
+.change-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.change-list li {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--line-faint);
+}
+
+.change-list li.add {
+  color: var(--water-deep);
+}
+
+.change-list li.remove,
+.change-list li.warn,
+.trouble {
+  color: var(--hazard);
+}
+
+.raw-edge-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+/* ---------- timeline ---------- */
+
+.timeline {
+  border-top: 1px solid var(--ink);
+  padding: 6px 18px 8px;
+  background: var(--paper);
+}
+
+.timeline-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.timeline-controls .spacer {
+  flex: 1;
+}
+
+.timeline-mode {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-soft);
+}
+
+.timeline-hint {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--accent);
+}
+
+.timeline-strip {
+  display: block;
+  width: 100%;
+  height: 46px;
+  cursor: crosshair;
+  background: var(--paper-inset);
+  border: 1px solid var(--line);
+}
+
+.tl-activity {
+  fill: var(--water);
+  fill-opacity: 0.75;
+}
+
+.tl-failures {
+  fill: var(--hazard);
+}
+
+.tl-axis {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.tl-cursor {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.tl-pin {
+  stroke: var(--accent);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
 }
 
 /* ---------- footer (chart margin data) ---------- */

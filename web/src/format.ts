@@ -37,6 +37,14 @@ export function formatCount(n: number): string {
   return String(n);
 }
 
+/** RTT in microseconds → human string. */
+export function formatRTT(us: number): string {
+  if (!us || us <= 0) return "–";
+  if (us < 1000) return `${us} µs`;
+  const ms = us / 1000;
+  return `${ms >= 100 ? ms.toFixed(0) : ms.toFixed(1)} ms`;
+}
+
 /** Shorten an executable path to its last two segments. */
 export function shortExe(exe: string): string {
   const parts = exe.split("/").filter(Boolean);

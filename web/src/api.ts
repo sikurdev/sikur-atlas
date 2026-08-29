@@ -1,4 +1,4 @@
-// Types mirroring internal/graph JSON, plus the live stream hook.
+// Types mirroring the Go API, plus the live stream hook and fetchers.
 import { useEffect, useRef, useState } from "react";
 
 export type NodeKind = "process" | "container" | "external";
@@ -11,11 +11,27 @@ export interface NodeData {
   containerId?: string;
   containerName?: string;
   image?: string;
+  composeProject?: string;
+  composeService?: string;
   pids?: number[];
   listenPorts?: number[];
   addrs?: string[];
   firstSeen: string;
   lastSeen: string;
+}
+
+export interface EdgeWindow {
+  seconds: number;
+  opens: number;
+  closes: number;
+  failures: number;
+  resets: number;
+  retransmits: number;
+  bytesSent: number;
+  bytesRecv: number;
+  rttAvgUs: number;
+  rttMaxUs: number;
+  activeEnd: number;
 }
 
 export interface EdgeData {
@@ -28,8 +44,13 @@ export interface EdgeData {
   activeConns: number;
   bytesSent: number;
   bytesRecv: number;
+  failures?: number;
+  resets?: number;
+  retransmits?: number;
+  lastRttUs?: number;
   firstSeen: string;
   lastSeen: string;
+  window?: EdgeWindow;
 }
 
 export interface GraphSnapshot {
@@ -39,12 +60,94 @@ export interface GraphSnapshot {
   edges: EdgeData[];
 }
 
+export type AppCategory = "app" | "system" | "external" | "atlas";
+
+export interface AppNode {
+  id: string;
+  label: string;
+  category: AppCategory;
+  kind: "compose" | "container" | "process" | "external";
+  members: string[];
+  memberCount: number;
+  image?: string;
+  exe?: string;
+  listenPorts?: number[];
+  firstSeen: string;
+  lastSeen: string;
+}
+
+export interface AppEdge {
+  id: string;
+  src: string;
+  dst: string;
+  dstPort: number;
+  protocol: string;
+  connections: number;
+  activeConns: number;
+  bytesSent: number;
+  bytesRecv: number;
+  failures?: number;
+  resets?: number;
+  retransmits?: number;
+  lastRttUs?: number;
+  firstSeen: string;
+  lastSeen: string;
+  window?: EdgeWindow;
+  rawEdges: string[];
+}
+
+export interface AppGraph {
+  generatedAt: string;
+  nodes: AppNode[];
+  edges: AppEdge[];
+}
+
+export interface EdgeChange {
+  edge: AppEdge;
+  changes: string[];
+  aConnections: number;
+  aFailures: number;
+  aResets: number;
+  aRetransmits: number;
+  aRttAvgUs: number;
+  aBytesSent: number;
+  aBytesRecv: number;
+}
+
+export interface Diff {
+  a: string;
+  b: string;
+  addedNodes: AppNode[] | null;
+  removedNodes: AppNode[] | null;
+  addedEdges: AppEdge[] | null;
+  removedEdges: AppEdge[] | null;
+  changedEdges: EdgeChange[] | null;
+}
+
+export interface TimelineBucket {
+  start: number;
+  opens: number;
+  closes: number;
+  failures: number;
+  trouble: number;
+}
+
+export interface TimelinePayload {
+  from: number;
+  to: number;
+  step: number;
+  buckets: TimelineBucket[];
+}
+
 export interface CollectorStats {
   events: number;
   openEvents: number;
   acceptEvents: number;
   establishedEvents: number;
   closeEvents: number;
+  retransEvents: number;
+  resetEvents: number;
+  failedConns: number;
   liveSockets: number;
   liveRecords: number;
 }
@@ -57,12 +160,18 @@ export interface MetaData {
   kernelDrops: number;
   decodeErrors: number;
   dockerEnrichment: boolean;
+  history: boolean;
+}
+
+export interface StreamPayload {
+  raw: GraphSnapshot;
+  app: AppGraph;
 }
 
 export type StreamStatus = "connecting" | "live" | "reconnecting";
 
 export interface GraphStream {
-  snapshot: GraphSnapshot | null;
+  payload: StreamPayload | null;
   status: StreamStatus;
 }
 
@@ -71,7 +180,7 @@ export interface GraphStream {
 export function useGraphStream(
   makeSource: () => EventSource = () => new EventSource("/api/stream"),
 ): GraphStream {
-  const [snapshot, setSnapshot] = useState<GraphSnapshot | null>(null);
+  const [payload, setPayload] = useState<StreamPayload | null>(null);
   const [status, setStatus] = useState<StreamStatus>("connecting");
   const makeSourceRef = useRef(makeSource);
 
@@ -79,7 +188,7 @@ export function useGraphStream(
     const source = makeSourceRef.current();
     const onSnapshot = (ev: MessageEvent) => {
       setStatus("live");
-      setSnapshot(JSON.parse(ev.data) as GraphSnapshot);
+      setPayload(JSON.parse(ev.data) as StreamPayload);
     };
     const onOpen = () => setStatus("live");
     const onError = () => setStatus("reconnecting");
@@ -91,7 +200,7 @@ export function useGraphStream(
     };
   }, []);
 
-  return { snapshot, status };
+  return { payload, status };
 }
 
 /** Polls /api/meta. */
@@ -115,4 +224,26 @@ export function useMeta(intervalMs = 5000): MetaData | null {
     };
   }, [intervalMs]);
   return meta;
+}
+
+async function getJSON<T>(url: string): Promise<T> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+  return (await res.json()) as T;
+}
+
+export function fetchGraphAt(at: number): Promise<GraphSnapshot> {
+  return getJSON(`/api/graph?at=${at}`);
+}
+
+export function fetchAppViewAt(at: number): Promise<AppGraph> {
+  return getJSON(`/api/appview?at=${at}`);
+}
+
+export function fetchCompare(a: number, b: number): Promise<Diff> {
+  return getJSON(`/api/compare?a=${a}&b=${b}`);
+}
+
+export function fetchTimeline(from: number, to: number, step: number): Promise<TimelinePayload> {
+  return getJSON(`/api/timeline?from=${from}&to=${to}&step=${step}`);
 }

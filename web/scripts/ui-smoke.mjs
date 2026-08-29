@@ -1,59 +1,144 @@
 #!/usr/bin/env node
-// Drives a real browser against a running agent and verifies the UI
-// renders the live graph: nodes appear, the stream reports live, and a
-// screenshot is captured as evidence.
+// Drives a real browser against a running agent and verifies the whole
+// investigation surface: live view, filtering, inspector, focus, raw
+// drill-down, Replay (?at=), Compare (?a=&b=) — with screenshots as
+// evidence.
 //
-// Usage: node web/scripts/ui-smoke.mjs [baseURL] [screenshotPath]
+// Usage: node web/scripts/ui-smoke.mjs [baseURL] [t1] [t2]
 import { chromium } from "playwright";
 
 const base = process.argv[2] ?? "http://127.0.0.1:7171";
-const shot = process.argv[3] ?? "atlas-ui.png";
+const t1 = Number(process.argv[3]) || null;
+const t2 = Number(process.argv[4]) || null;
 const MIN_NODES = Number(process.env.UI_SMOKE_MIN_NODES ?? "5");
+
+const checks = [];
+const ok = (what) => {
+  checks.push(what);
+  console.log("  ✓ " + what);
+};
 
 const browser = await chromium.launch();
 try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-  await page.goto(base, { waitUntil: "domcontentloaded" });
 
+  // ---- live view (Services / Overview by default) ----
+  await page.goto(base, { waitUntil: "domcontentloaded" });
   await page.waitForFunction(
     (min) => document.querySelectorAll('[data-testid="node"]').length >= min,
     MIN_NODES,
     { timeout: 45000 },
   );
-  const nodeCount = await page
-    .locator('[data-testid="node"]')
-    .count();
-  const edgeCount = await page.locator('[data-testid="edge"]').count();
   const status = await page.getByTestId("status").innerText();
-
   if (!status.includes("live")) {
     throw new Error(`stream status is ${JSON.stringify(status)}, want live`);
   }
+  const liveNodes = await page.locator('[data-testid="node"]').count();
+  ok(`live service view renders ${liveNodes} nodes, status live`);
+  await page.waitForTimeout(2500); // let the layout settle
+  await page.screenshot({ path: "atlas-ui-live.png" });
 
-  // Let the force layout settle and capture the evidence screenshot
-  // before the interaction assertions, so it exists even if they fail.
-  await page.waitForTimeout(3500);
-  await page.screenshot({ path: shot });
-
-  // Select a node and check the inspector opens. Aim at the node's
-  // symbol shape: the <g> bounding-box center falls in the gap between
-  // symbol and label. force: the layout may still drift if background
-  // traffic keeps adding nodes, and playwright's stability wait would
-  // time out on a moving SVG element.
-  await page
-    .locator('[data-testid="node"] .symbol')
-    .first()
-    .click({ force: true });
-  await page.waitForSelector('[data-testid="inspector-node"]', {
-    timeout: 5000,
-  });
-
-  console.log(
-    `UI SMOKE OK: ${nodeCount} nodes, ${edgeCount} edges rendered, ` +
-      `status live, inspector opens; screenshot: ${shot}`,
+  // ---- filtering dims non-matching nodes ----
+  await page.getByLabel("Filter nodes").fill("cache");
+  await page.waitForFunction(
+    () => document.querySelectorAll(".node.dimmed").length >= 1,
+    undefined,
+    { timeout: 5000 },
   );
+  ok("search filter dims non-matching nodes");
+  await page.getByLabel("Filter nodes").fill("");
+
+  // ---- inspector + focus + blast radius ----
+  const cacheNode = page
+    .locator('[data-testid="node"]', { hasText: "cache" })
+    .first();
+  await cacheNode.locator(".symbol").first().click({ force: true });
+  await page.waitForSelector('[data-testid="inspector-node"]', { timeout: 5000 });
+  await page.waitForSelector('[data-testid="deps-in"]', { timeout: 5000 });
+  ok("inspector shows node identity and dependants");
+
+  await page.getByTestId("btn-focus").click();
+  await page.waitForFunction(
+    () => document.querySelectorAll(".node.dimmed").length >= 1,
+    undefined,
+    { timeout: 5000 },
+  );
+  ok("focus dims nodes outside the dependency closure");
+  await page.screenshot({ path: "atlas-ui-focus.png" });
+  await page.getByTestId("btn-focus").click(); // unfocus
+
+  // ---- raw drill-down ----
+  await page.getByTestId("btn-raw").click();
+  await page.waitForFunction(
+    (min) => document.querySelectorAll('[data-testid="node"]').length >= min,
+    liveNodes,
+    { timeout: 10000 },
+  );
+  const rawNodes = await page.locator('[data-testid="node"]').count();
+  ok(`raw drill-down shows ${rawNodes} raw nodes (>= ${liveNodes} services)`);
+  await page.getByTestId("btn-view-app").click();
+
+  // ---- timeline is present and live ----
+  await page.waitForSelector('[data-testid="timeline-strip"]', { timeout: 5000 });
+  ok("timeline strip renders");
+
+  if (t1 != null) {
+    // ---- Replay at T1: the stopped service is back on screen ----
+    await page.goto(`${base}/?at=${t1}`, { waitUntil: "domcontentloaded" });
+    await page
+      .locator('[data-testid="node"]', { hasText: "inventory" })
+      .first()
+      .waitFor({ timeout: 15000 });
+    const mode = await page.getByTestId("time-mode").innerText();
+    if (!mode.includes("viewing")) {
+      throw new Error(`replay mode label wrong: ${mode}`);
+    }
+    ok("replay at T1 reconstructs the stopped inventory service");
+    await page.waitForTimeout(1500);
+    await page.screenshot({ path: "atlas-ui-replay.png" });
+  }
+
+  if (t1 != null && t2 != null) {
+    // ---- Compare T1 vs T2: the change is identified ----
+    await page.goto(`${base}/?a=${t1}&b=${t2}`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector('[data-testid="inspector-diff"]', {
+      timeout: 15000,
+    });
+    const removed = await page.getByTestId("diff-removed").innerText();
+    if (!removed.includes("inventory")) {
+      throw new Error(`compare panel misses inventory: ${removed}`);
+    }
+    await page
+      .locator('[data-testid="node"][data-diff="removed"]')
+      .first()
+      .waitFor({ timeout: 10000 });
+    ok("compare identifies the removed service in panel and on canvas");
+    await page.waitForTimeout(1500);
+    await page.screenshot({ path: "atlas-ui-compare.png" });
+
+    // Exit compare back to live.
+    await page.getByTestId("btn-exit-compare").click();
+    await page.getByTestId("btn-live").click();
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector('[data-testid="status"]');
+        return el && el.textContent && el.textContent.includes("live");
+      },
+      undefined,
+      { timeout: 10000 },
+    );
+    ok("exit compare returns to live");
+  }
+
+  console.log(`UI E2E OK: ${checks.length} interactions verified`);
 } catch (err) {
-  console.error("UI SMOKE FAILED:", err.message ?? err);
+  console.error("UI E2E FAILED:", err.message ?? err);
+  try {
+    const page = (await browser.contexts())[0]?.pages()[0];
+    if (page) await page.screenshot({ path: "atlas-ui-failure.png" });
+  } catch {
+    // best effort
+  }
   process.exitCode = 1;
 } finally {
   await browser.close();

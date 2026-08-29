@@ -1,5 +1,5 @@
-// Force-layout wrapper that keeps node positions stable across live
-// snapshot updates: nodes are matched by id, new nodes enter near an
+// Force-layout wrapper (Explore mode) that keeps node positions stable
+// across live updates: nodes are matched by id, new nodes enter near an
 // already-placed neighbor, vanished nodes are dropped.
 import {
   forceCollide,
@@ -13,16 +13,16 @@ import {
   type SimulationNodeDatum,
 } from "d3-force";
 
-import type { EdgeData, GraphSnapshot, NodeData } from "./api";
+import type { DisplayEdge, DisplayGraph, DisplayNode } from "./display";
 
 export interface SimNode extends SimulationNodeDatum {
   id: string;
-  data: NodeData;
+  data: DisplayNode;
 }
 
 export interface SimEdge extends SimulationLinkDatum<SimNode> {
   id: string;
-  data: EdgeData;
+  data: DisplayEdge;
 }
 
 export class GraphSim {
@@ -41,10 +41,10 @@ export class GraphSim {
       .stop();
   }
 
-  /** Merge a fresh snapshot, preserving existing layout state. */
-  update(snapshot: GraphSnapshot): void {
+  /** Merge a fresh graph, preserving existing layout state. */
+  update(g: DisplayGraph): void {
     const seen = new Set<string>();
-    for (const data of snapshot.nodes) {
+    for (const data of g.nodes) {
       seen.add(data.id);
       const existing = this.nodesById.get(data.id);
       if (existing) {
@@ -52,7 +52,7 @@ export class GraphSim {
         continue;
       }
       const node: SimNode = { id: data.id, data };
-      const anchor = this.anchorFor(data.id, snapshot.edges);
+      const anchor = this.anchorFor(data.id, g.edges);
       // Deterministic pseudo-random spread so simultaneous arrivals fan
       // out instead of stacking.
       const angle = (this.seq++ * 2.399963) % (2 * Math.PI); // golden angle
@@ -65,7 +65,7 @@ export class GraphSim {
       if (!seen.has(id)) this.nodesById.delete(id);
     }
 
-    this.simEdges = snapshot.edges
+    this.simEdges = g.edges
       .filter((e) => this.nodesById.has(e.src) && this.nodesById.has(e.dst))
       .map((e) => ({
         id: e.id,
@@ -100,7 +100,7 @@ export class GraphSim {
     }
   }
 
-  private anchorFor(id: string, edges: EdgeData[]): SimNode | undefined {
+  private anchorFor(id: string, edges: DisplayEdge[]): SimNode | undefined {
     for (const e of edges) {
       if (e.src === id && this.nodesById.has(e.dst)) {
         return this.nodesById.get(e.dst);

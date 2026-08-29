@@ -46,15 +46,15 @@ func DecodeEvent(b []byte, toTime func(nsec uint64) time.Time) (model.ConnEvent,
 	copy(daddr[:], b[offDaddr:offDaddr+16])
 
 	ev := model.ConnEvent{
-		Time:      toTime(le.Uint64(b[offTsNs:])),
-		Type:      model.EventType(le.Uint32(b[offType:])),
-		PID:       le.Uint32(b[offPID:]),
-		Comm:      commString(b[offComm : offComm+16]),
-		SockID:    le.Uint64(b[offSockID:]),
-		Src:       addrPort(saddr, le.Uint16(b[offSport:])),
-		Dst:       addrPort(daddr, le.Uint16(b[offDport:])),
-		BytesSent: le.Uint64(b[offBytesSent:]),
-		BytesRecv: le.Uint64(b[offBytesRecv:]),
+		Time:       toTime(le.Uint64(b[offTsNs:])),
+		Type:       model.EventType(le.Uint32(b[offType:])),
+		PID:        le.Uint32(b[offPID:]),
+		Comm:       commString(b[offComm : offComm+16]),
+		SockID:     le.Uint64(b[offSockID:]),
+		Src:        addrPort(saddr, le.Uint16(b[offSport:])),
+		Dst:        addrPort(daddr, le.Uint16(b[offDport:])),
+		BytesSent:  le.Uint64(b[offBytesSent:]),
+		BytesRecv:  le.Uint64(b[offBytesRecv:]),
 		SRTTMicros: le.Uint32(b[offSrttUs:]),
 	}
 	return ev, nil

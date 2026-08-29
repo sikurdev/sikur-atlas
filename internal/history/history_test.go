@@ -10,7 +10,7 @@ import (
 
 var t0 = time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
 
-func openTest(t *testing.T, g *graph.Store) (*Store, string) {
+func openTest(t *testing.T, g *graph.Store) *Store {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "history.db")
 	s, err := Open(path, g, WithSpans(10*time.Second, 60*time.Second))
@@ -18,7 +18,7 @@ func openTest(t *testing.T, g *graph.Store) (*Store, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
-	return s, path
+	return s
 }
 
 func seedGraph() *graph.Store {
@@ -36,7 +36,7 @@ func edgeID() string { return "proc:/usr/bin/curl->proc:/usr/sbin/nginx:8080" }
 // different graph states.
 func TestSnapshotAtReconstructsTwoStates(t *testing.T) {
 	g := seedGraph()
-	s, _ := openTest(t, g)
+	s := openTest(t, g)
 	id := edgeID()
 
 	// Era A: connections at t0.
@@ -153,7 +153,7 @@ func TestHistorySurvivesReopen(t *testing.T) {
 
 func TestWindowHealthMergesUnflushed(t *testing.T) {
 	g := seedGraph()
-	s, _ := openTest(t, g)
+	s := openTest(t, g)
 	id := edgeID()
 
 	// Flushed activity.
@@ -184,7 +184,7 @@ func TestWindowHealthMergesUnflushed(t *testing.T) {
 
 func TestTimeline(t *testing.T) {
 	g := seedGraph()
-	s, _ := openTest(t, g)
+	s := openTest(t, g)
 	id := edgeID()
 
 	s.EdgeOpened(id, t0)
@@ -218,7 +218,7 @@ func TestTimeline(t *testing.T) {
 // ability to reconstruct (at reduced resolution).
 func TestCompactPreservesHistory(t *testing.T) {
 	g := seedGraph()
-	s, _ := openTest(t, g) // fine 10s, coarse 60s
+	s := openTest(t, g) // fine 10s, coarse 60s
 	id := edgeID()
 
 	for i := 0; i < 6; i++ {
@@ -275,7 +275,7 @@ func TestCompactPreservesHistory(t *testing.T) {
 // the node was not observed listening.
 func TestReplayHidesStaleListenPorts(t *testing.T) {
 	g := seedGraph()
-	s, _ := openTest(t, g)
+	s := openTest(t, g)
 	id := edgeID()
 
 	s.EdgeOpened(id, t0)
