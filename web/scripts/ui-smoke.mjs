@@ -30,19 +30,23 @@ try {
     throw new Error(`stream status is ${JSON.stringify(status)}, want live`);
   }
 
-  // Let the force layout settle, then select a node and check the
-  // inspector opens. force: the layout may still drift if background
+  // Let the force layout settle and capture the evidence screenshot
+  // before the interaction assertions, so it exists even if they fail.
+  await page.waitForTimeout(3500);
+  await page.screenshot({ path: shot });
+
+  // Select a node and check the inspector opens. Aim at the node's
+  // symbol shape: the <g> bounding-box center falls in the gap between
+  // symbol and label. force: the layout may still drift if background
   // traffic keeps adding nodes, and playwright's stability wait would
   // time out on a moving SVG element.
-  await page.waitForTimeout(2500);
-  await page.locator('[data-testid="node"]').first().click({ force: true });
+  await page
+    .locator('[data-testid="node"] .symbol')
+    .first()
+    .click({ force: true });
   await page.waitForSelector('[data-testid="inspector-node"]', {
     timeout: 5000,
   });
-
-  // Let the force layout settle before the evidence screenshot.
-  await page.waitForTimeout(3000);
-  await page.screenshot({ path: shot });
 
   console.log(
     `UI SMOKE OK: ${nodeCount} nodes, ${edgeCount} edges rendered, ` +
