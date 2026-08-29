@@ -20,7 +20,8 @@ history → projection → API/UI.
 
 ## Kernel side (bpf/atlas.bpf.c)
 
-Four attach points cover the TCP connection lifecycle and its health:
+Nine attach points cover TCP connection lifecycles and health, AF_UNIX
+connects, and process lifecycle. The TCP four first:
 
 **`tracepoint:sock/inet_sock_set_state`** — a stable-ABI tracepoint that
 fires on every TCP state transition, kernel-wide, across all network
@@ -57,6 +58,25 @@ that silently misreads on half the fleet is worse than a narrower
 honest one. For local-to-local traffic both ends are local, so the
 receive side captures the event anyway.
 
+**`kprobe`+`kretprobe:unix_stream_connect`** — an AF_UNIX `connect()`
+in the calling process's context. The entry probe captures the target
+`sun_path` (filesystem path, or `@name` for abstract sockets) and
+stashes it keyed by thread; the return probe emits one event carrying
+pid, comm, path and the syscall's return code — so successful connects
+and refused/missing-socket failures are both counted, attributed to
+the caller. Rate and outcome only; standing pairs come from the socket
+table (below).
+
+**`tracepoint:sched/sched_process_exec`** and
+**`sched/sched_process_exit`** — process lifecycle. Exec events carry
+the new executable's filename; exit events fire only for the group
+leader (thread exits are not service lifecycle) and carry the raw exit
+code, from which the collector decodes clean exits, signal kills and
+crashes. **`tracepoint:oom/mark_victim`** — fires the moment the
+kernel OOM killer picks a victim, before the process is gone: pid is
+the only field read, so the record layout question that plagues
+version-dependent tracepoints does not arise.
+
 ### Health signal semantics
 
 | Signal | Source | Caveats |
@@ -68,15 +88,19 @@ receive side captures the event anyway.
 | connection rate | establishment events per bucket | — |
 | active connections | opens − closes, tracked per edge | released by the idle sweep if a close event is lost |
 | bytes | `tcp_sock.bytes_sent/received` (RFC 4898 data octets) at CLOSE | nothing until a connection closes; `bytes_sent` includes retransmitted octets |
+| unix connects / failures | `unix_stream_connect` return code | stream sockets only; attributed by socket path, see AF_UNIX section |
+| unix active pairs | sock_diag socket-table scan | standing connections only; a pair shorter than the scan interval shows in connect counts but not as active |
 
 Deliberately *not* shown, because they cannot be measured truthfully
 from these attach points: per-request latency (needs L7 parsing),
-mid-life throughput of open connections (no per-ACK sampling in v0.2),
-UDP anything.
+mid-life throughput of open connections (no per-ACK sampling),
+byte counts for AF_UNIX traffic (the kernel keeps no per-socket
+octet counters for unix sockets), UDP anything.
 
-Events (104-byte fixed struct, little-endian) stream over a 1 MiB ring
+Events (168-byte fixed struct, little-endian) stream over a 1 MiB ring
 buffer; a per-CPU counter records drops, exposed at `/api/meta`. The
-programs never read packet payloads — only connection metadata.
+programs never read packet or socket payloads — only connection and
+process metadata.
 
 CO-RE without the 3 MB generated header: `bpf/include/vmlinux_min.h`
 declares just the dozen kernel types the programs touch, all marked
@@ -127,6 +151,115 @@ images resolve asynchronously through the Docker socket when readable;
 otherwise short ids are shown. Listening ports come from accepted
 connections plus a periodic `/proc/net/tcp{,6}` scan across network
 namespaces with inode→pid attribution.
+
+## AF_UNIX topology (internal/unixdiag, internal/collector/unix.go)
+
+Two independent evidence paths, deliberately kept apart because they
+answer different questions:
+
+**Standing pairs — who is connected right now.** The scan loop dumps
+the kernel's AF_UNIX socket table over netlink `sock_diag`
+(`UDIAG_SHOW_NAME|UDIAG_SHOW_PEER`) — the same evidence `ss -x` shows:
+inode, peer inode, bound path, state. AF_UNIX sockets belong to the
+network namespace of the process that created them and a dump only
+sees its own namespace, so the dump runs once per namespace, entering
+each via `setns` on `/proc/<pid>/ns/net` (one representative pid per
+namespace, collected during the same `/proc` walk that maps socket
+inodes to owning pids). Peer inodes are system-global, so pairing
+works across namespaces — which is exactly the demo's case: a client
+in one container connected through a shared-volume socket to a server
+in another.
+
+An edge is drawn only when the kernel's pairing gives a truthful
+direction: an *unnamed* socket peered with a *named* one is
+client→server (accepted stream sockets inherit the listener's name;
+named datagram receivers are servers). `socketpair()` twins
+(unnamed↔unnamed) and named↔named pairs carry no direction and are
+skipped rather than guessed. New pairs raise the edge's active count,
+vanished pairs release it.
+
+**Connect events — how often, and does it fail.** The
+`unix_stream_connect` probes count every connect attempt with its
+return code, attributed to the target service through a path→owner
+index built from the dump's listeners. This is what catches
+connections too short to overlap a scan (a request-per-connection
+client shows a connect rate even when no pair is ever seen standing)
+and connects to sockets nobody listens on (failures). A path with no
+known listener attributes to a placeholder external node — stated as
+unknown rather than invented.
+
+Both paths update the same edge (keyed src→dst plus socket path), and
+the two counters stay distinct — connects are never derived from pair
+sightings or vice versa, so nothing is double-counted.
+
+## Process lifecycle (internal/collector/lifecycle.go)
+
+Exec, exit and OOM events are correlated to graph nodes by pid: the
+collector remembers which node each observed pid belongs to (bounded
+map, populated by connection attribution and listener scans), with a
+live `/proc` resolve as fallback while the process still exists. Exit
+codes decode into three kinds: clean exit (status), signal kill, and
+crash (the fatal-signal set: SEGV, ABRT, BUS, ILL, FPE). OOM
+victims get their own kind — `mark_victim` fires while the process
+still exists, so attribution is reliable even though the exit that
+follows arrives as an ordinary SIGKILL.
+
+Lifecycle is service history, not an audit log: events are recorded
+only for processes that belong to services already in the topology
+(every short-lived shell on the host would otherwise flood the store),
+capped per node per flush window, with a drop counter in `/api/meta`
+when the cap bites. Events land in their own SQLite table at full
+resolution, feed timeline markers, the per-node inspector digest,
+`/api/lifecycle`, and Compare — which lists the events that happened
+between its two moments, so "users was OOM-killed and restarted at
+14:02:41" is part of the diff, not something to infer from presence
+gaps.
+
+## Resource samples (internal/resources)
+
+A sampler ticks every 10 s and reads, for each node currently in the
+topology (never more — overhead is bounded by topology size, not
+machine size):
+
+- cgroup v2, resolved from `/proc/<pid>/cgroup`: `cpu.stat`
+  (`usage_usec`, `throttled_usec`), `memory.current`, `memory.max`,
+  `memory.events` (`oom_kill`), `io.stat` (summed across devices), and
+  the cgroup's `cpu.pressure`/`memory.pressure` (PSI `some` averages)
+  where the kernel provides them;
+- `/proc` fallback for processes without a private cgroup:
+  `stat`/`statm`/`io` summed across the node's known pids, fd and
+  thread counts from `fd/` and `stat`.
+
+Monotonic counters (CPU time, throttle time, I/O bytes, OOM kills)
+are recorded as deltas per sample window; gauges (RSS, limits, fds,
+procs) keep the sample's value, and bucket aggregation keeps their
+maximum — a spike that lives shorter than a bucket still shows. Host
+PSI (`/proc/pressure/*`) is read once per tick and exposed in
+`/api/meta`, not attributed to any node.
+
+Samples flush with the same staged pipeline as connection buckets into
+a `node_metrics` table keyed (node, bucket, span): 10-second rows for
+2 hours, compacted to 5-minute rows (sums of deltas, max of gauges),
+dropped after 7 days. The appview attaches the metric window to each
+service (summing deltas, max-ing gauges across group members), so
+live view, Replay and Compare all carry resources; Compare reports
+movements past fixed floors (250 ms CPU, 32 MiB RSS, 100 ms throttle —
+an OOM kill always reports).
+
+## atlas top (internal/tui)
+
+A terminal client in the same binary, deliberately thin: it consumes
+`/api/appview`, `/api/meta` and `/api/lifecycle` over HTTP exactly as
+the web UI does, and contains no collection, correlation or projection
+logic of its own — `BuildRows` maps the served projection onto table
+rows and that is the whole data path. One row per service: CPU%, RSS,
+active connections, connect rate, failures, worst outgoing RTT,
+dependency/caller counts; sort cycling, substring filter, focus (the
+same transitive-closure semantics as the web UI, computed over the
+served edges), Enter for a per-service drill-down with its edges,
+resources and recent lifecycle. Raw-mode ANSI rendering with no
+external TUI dependency (`golang.org/x/term` only); `--once` prints a
+single frame for scripts, which is how CI smoke-tests it.
 
 ## Live graph, history, and Replay
 
@@ -221,6 +354,24 @@ straight from `/api/compare` output. There is no inference layer.
 - Replay resolution is the bucket span: 10 s for the last 2 hours, 5 min
   beyond, nothing past 7 days (defaults).
 - Reset counts cover RSTs received by local sockets only.
+- AF_UNIX connect *events* attribute by socket path string, which is
+  mount-namespace blind: two containers each binding the same path
+  (say `/tmp/app.sock`) share one edge's connect counters. Standing
+  pairs are exempt — they pair by socket inode, which is exact.
+- A unix connection shorter than the scan interval (30 s) never shows
+  as an active pair; its evidence is the connect counter. Byte counts
+  for unix traffic don't exist at all (the kernel keeps none).
+- Unix connect events observed before the first scan indexes the
+  target's listener attribute to a placeholder path node, not the
+  owning service; the index catches up within one scan interval.
+- Lifecycle events are recorded only for services already on the map:
+  the *first* exec of a brand-new container generally predates its
+  node and is dropped (counted in `/api/meta`); restarts, exits and
+  OOM kills of known services are all captured.
+- Resource samples are 10 s apart; a spike living entirely between two
+  samples is invisible. CPU/IO deltas need two samples, so a node's
+  first window appears ~20 s after it does. PSI lines require kernel
+  PSI support (`CONFIG_PSI=y`, default on mainstream distros).
 - Compare answers with recorded facts; it does not rank causes. The
   ordering of "what broke first" within one bucket is not knowable.
 

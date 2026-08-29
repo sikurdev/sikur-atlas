@@ -107,7 +107,7 @@ func run(listen, dockerSocket, dbPath string, scanInterval time.Duration) error 
 		return fmt.Errorf("%w\n\nAtlas needs root (or CAP_BPF+CAP_PERFMON) and a kernel >= 5.8 built with BTF (/sys/kernel/btf/vmlinux)", err)
 	}
 	defer tracer.Close()
-	log.Printf("eBPF programs attached (inet_sock_set_state, tcp_retransmit_skb, tcp_receive_reset, kretprobe inet_csk_accept)")
+	log.Printf("eBPF programs attached (inet_sock_set_state, tcp_retransmit_skb, tcp_receive_reset, sched_process_exec/exit, oom mark_victim, kprobes inet_csk_accept + unix_stream_connect)")
 
 	// Periodic work: correlator ticks and listening-socket scans.
 	go func() {

@@ -130,14 +130,44 @@ type Store struct {
 	edges   map[string]*Edge
 	version uint64
 	subs    map[chan struct{}]struct{}
+	// pending holds container/compose metadata that arrived before its
+	// node existed (async enrichment can win that race — a container's
+	// exec event enqueues a lookup before its first connection creates
+	// the node). Applied and cleared when the node appears.
+	pending map[string]*pendingMeta
 }
+
+type pendingMeta struct {
+	name, image      string
+	project, service string
+}
+
+// pendingMetaCap bounds the stash; enrichment retries cover eviction.
+const pendingMetaCap = 4096
 
 func NewStore() *Store {
 	return &Store{
-		nodes: make(map[string]*Node),
-		edges: make(map[string]*Edge),
-		subs:  make(map[chan struct{}]struct{}),
+		nodes:   make(map[string]*Node),
+		edges:   make(map[string]*Edge),
+		subs:    make(map[chan struct{}]struct{}),
+		pending: make(map[string]*pendingMeta),
 	}
+}
+
+// pendingFor returns (creating if needed) the stash entry for a node id.
+func (s *Store) pendingFor(nodeID string) *pendingMeta {
+	if p, ok := s.pending[nodeID]; ok {
+		return p
+	}
+	if len(s.pending) >= pendingMetaCap {
+		for k := range s.pending {
+			delete(s.pending, k)
+			break
+		}
+	}
+	p := &pendingMeta{}
+	s.pending[nodeID] = p
+	return p
 }
 
 // EdgeID derives the stable edge identity used by ObserveConnection.
@@ -387,18 +417,37 @@ func (s *Store) edgeCounter(edgeID string, at time.Time, apply func(*Edge)) {
 }
 
 // SetComposeIdentity attaches docker-compose project/service labels to a
-// node.
+// node. Labels arriving before the node exists are stashed and applied
+// when it appears.
 func (s *Store) SetComposeIdentity(nodeID, project, service string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	n, ok := s.nodes[nodeID]
-	if !ok || (n.ComposeProject == project && n.ComposeService == service) {
+	if !ok {
+		p := s.pendingFor(nodeID)
+		p.project, p.service = project, service
+		return
+	}
+	if n.ComposeProject == project && n.ComposeService == service {
 		return
 	}
 	n.ComposeProject = project
 	n.ComposeService = service
 	s.bumpLocked()
+}
+
+// UpsertNode ensures a node exists with the given identity. Used for
+// listeners observed outside any connection — e.g. an AF_UNIX server
+// that never speaks TCP would otherwise exist only as a bare id.
+func (s *Store) UpsertNode(spec NodeSpec, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, existed := s.nodes[spec.ID]
+	s.upsertNodeLocked(spec, at)
+	if !existed {
+		s.bumpLocked()
+	}
 }
 
 // ListenerSet is one node's complete set of listening ports as observed
@@ -441,12 +490,16 @@ func (s *Store) SyncListeners(sets []ListenerSet, at time.Time) {
 }
 
 // SetContainerMeta attaches a resolved container name/image to a node.
+// Metadata arriving before the node exists is stashed and applied when
+// it appears.
 func (s *Store) SetContainerMeta(nodeID, name, image string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	n, ok := s.nodes[nodeID]
 	if !ok {
+		p := s.pendingFor(nodeID)
+		p.name, p.image = name, image
 		return
 	}
 	changed := false
@@ -476,6 +529,18 @@ func (s *Store) upsertNodeLocked(spec NodeSpec, at time.Time) *Node {
 			FirstSeen:   at,
 		}
 		s.nodes[spec.ID] = n
+		if p, held := s.pending[spec.ID]; held {
+			delete(s.pending, spec.ID)
+			if p.name != "" {
+				n.ContainerName = p.name
+				n.Label = p.name
+			}
+			if p.image != "" {
+				n.Image = p.image
+			}
+			n.ComposeProject = p.project
+			n.ComposeService = p.service
+		}
 	}
 	if at.After(n.LastSeen) {
 		n.LastSeen = at

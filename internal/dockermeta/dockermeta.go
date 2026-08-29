@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -143,6 +144,10 @@ func (e *Enricher) Run(ctx context.Context) {
 				e.done[cid] = time.Time{}
 			}
 			e.mu.Unlock()
+			if err != nil {
+				// At most one line per container per retry window.
+				log.Printf("docker enrichment: %v (will retry)", err)
+			}
 			if err == nil {
 				e.apply(cid, meta)
 			}

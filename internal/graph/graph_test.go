@@ -155,6 +155,42 @@ func TestSetContainerMetaUpdatesLabel(t *testing.T) {
 	}
 }
 
+// Async enrichment can resolve a container before its first connection
+// creates the node (its exec event enqueues the lookup at container
+// start). The metadata must survive that race and land when the node
+// appears — this exact ordering made every demo container keep its
+// short-id label on a real kernel.
+func TestContainerMetaBeforeNodeExists(t *testing.T) {
+	s := NewStore()
+	s.SetContainerMeta("container:abc123def456", "demo-gateway", "nginx:alpine")
+	s.SetComposeIdentity("container:abc123def456", "demo", "gateway")
+
+	cs := NodeSpec{ID: "container:abc123def456", Kind: NodeContainer, Label: "abc123def456", ContainerID: "abc123def456" + "0000"}
+	s.ObserveConnection(cs, spec("x", NodeExternal, 0), 80, t0)
+
+	var n Node
+	for _, cand := range s.Snapshot().Nodes {
+		if cand.ID == "container:abc123def456" {
+			n = cand
+		}
+	}
+	if n.Label != "demo-gateway" || n.ContainerName != "demo-gateway" || n.Image != "nginx:alpine" {
+		t.Fatalf("stashed meta not applied on creation: %+v", n)
+	}
+	if n.ComposeProject != "demo" || n.ComposeService != "gateway" {
+		t.Fatalf("stashed compose identity not applied: %+v", n)
+	}
+
+	// The stash is consumed: a second node with the same id cannot
+	// exist, and re-creating after removal must not resurrect old meta.
+	s.mu.Lock()
+	if len(s.pending) != 0 {
+		s.mu.Unlock()
+		t.Fatal("pending stash not cleared after apply")
+	}
+	s.mu.Unlock()
+}
+
 func TestSubscribeCoalesces(t *testing.T) {
 	s := NewStore()
 	ch, cancel := s.Subscribe()

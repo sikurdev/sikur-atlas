@@ -72,11 +72,14 @@ func BuildUnixPairs(socks []unixdiag.Socket, inodeToPID map[uint64]uint32) ([]Un
 func (c *Correlator) SyncUnixTopology(socks []unixdiag.Socket, inodeToPID map[uint64]uint32, at time.Time) {
 	pairs, listeners := BuildUnixPairs(socks, inodeToPID)
 
-	// Refresh the path index (shared with the event path).
+	// Refresh the path index (shared with the event path). The listener
+	// node is created with its full identity here: a unix-only server
+	// (no TCP at all) is otherwise never materialized properly.
 	index := make(map[string]string, len(listeners))
 	for path, pid := range listeners {
 		info := c.resolver.Resolve(pid, "")
 		spec := c.specForProcess(info, "")
+		c.store.UpsertNode(spec, at)
 		index[path] = spec.ID
 	}
 	c.addrMu.Lock()

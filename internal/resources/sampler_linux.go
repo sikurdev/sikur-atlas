@@ -45,6 +45,7 @@ type Sampler struct {
 
 	mu      sync.Mutex
 	prev    map[string]prevTotals
+	lastAt  time.Time
 	hostPSI HostPSI
 }
 
@@ -64,6 +65,17 @@ func (sm *Sampler) HostPressure() HostPSI {
 func (sm *Sampler) Sample(at time.Time) {
 	snap := sm.store.Snapshot()
 	pageSize := uint64(os.Getpagesize())
+
+	// The delta window is the real gap since the previous pass; a
+	// node's baseline is at most one pass old (newer ones are skipped).
+	sm.mu.Lock()
+	last := sm.lastAt
+	sm.lastAt = at
+	sm.mu.Unlock()
+	windowSecs := 0
+	if !last.IsZero() {
+		windowSecs = int(at.Sub(last).Round(time.Second) / time.Second)
+	}
 
 	for i := range snap.Nodes {
 		n := &snap.Nodes[i]
@@ -85,9 +97,10 @@ func (sm *Sampler) Sample(at time.Time) {
 		prev, had := sm.prev[n.ID]
 		sm.prev[n.ID] = totals
 		sm.mu.Unlock()
-		if !had || !prev.valid {
+		if !had || !prev.valid || windowSecs <= 0 {
 			continue // baseline only
 		}
+		m.WindowSecs = windowSecs
 		m.CPUMillis = sub(totals.cpuMillis, prev.cpuMillis)
 		m.IOReadBytes = sub(totals.ioRead, prev.ioRead)
 		m.IOWriteBytes = sub(totals.ioWrite, prev.ioWrite)
