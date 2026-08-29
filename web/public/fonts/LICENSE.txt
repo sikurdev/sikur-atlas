@@ -1,0 +1,5 @@
+The IBM Plex Sans and IBM Plex Mono font files in this directory are
+Copyright IBM Corp., licensed under the SIL Open Font License 1.1
+(https://opensource.org/licenses/OFL-1.1). Obtained as latin-subset
+woff2 builds from the Fontsource distribution
+(https://fontsource.org, https://github.com/fontsource/font-files).

@@ -1,0 +1,63 @@
+name: atlas-demo
+
+# A small but non-trivial service topology for Atlas to discover:
+#
+#   loadgen -> gateway(nginx):8080 -> orders:8000 -> inventory:8000
+#                                  \-> users:8000 \-> cache:6379
+#                                       \-> cache:6379
+#
+# Every service is an unmodified public image running a stdlib-only
+# script, so the demo needs no image builds and no package installs.
+
+services:
+  gateway:
+    image: nginx:1.27-alpine
+    container_name: atlas-demo-gateway
+    volumes:
+      - ./services/gateway.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - orders
+      - users
+
+  orders:
+    image: python:3.12-alpine
+    container_name: atlas-demo-orders
+    command: ["python", "/app/orders.py"]
+    volumes:
+      - ./services:/app:ro
+    depends_on:
+      - cache
+      - inventory
+
+  users:
+    image: python:3.12-alpine
+    container_name: atlas-demo-users
+    command: ["python", "/app/users.py"]
+    volumes:
+      - ./services:/app:ro
+    depends_on:
+      - cache
+
+  inventory:
+    image: python:3.12-alpine
+    container_name: atlas-demo-inventory
+    command: ["python", "/app/inventory.py"]
+    volumes:
+      - ./services:/app:ro
+
+  cache:
+    image: redis:7-alpine
+    container_name: atlas-demo-cache
+
+  loadgen:
+    image: python:3.12-alpine
+    container_name: atlas-demo-loadgen
+    command: ["python", "/app/loadgen.py"]
+    volumes:
+      - ./services:/app:ro
+    environment:
+      LOADGEN_INTERVAL: "0.4"
+    depends_on:
+      - gateway

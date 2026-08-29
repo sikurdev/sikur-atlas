@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  GOLANGCI_LINT_VERSION: v2.13.2
+
+jobs:
+  verify:
+    name: verify (build + lint + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install clang
+        run: sudo apt-get update -q && sudo apt-get install -y -q clang
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" "$GOLANGCI_LINT_VERSION"
+      - name: make verify
+        run: make verify
+
+  e2e:
+    name: e2e (real eBPF + demo workload)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install clang
+        run: sudo apt-get update -q && sudo apt-get install -y -q clang
+      - name: Install web dependencies
+        run: cd web && npm ci --no-audit --no-fund
+      - name: Install chromium for the UI smoke test
+        run: cd web && npx playwright install --with-deps chromium
+      - name: Kernel and BTF sanity
+        run: |
+          uname -a
+          ls -la /sys/kernel/btf/vmlinux
+      - name: Run end-to-end demo
+        run: make e2e
+      - name: Upload UI screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-ui-screenshot
+          path: atlas-ui-e2e.png
+          if-no-files-found: ignore
