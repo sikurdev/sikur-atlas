@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -26,16 +27,18 @@ import (
 	"github.com/sikurdev/sikur-atlas/internal/dockermeta"
 	"github.com/sikurdev/sikur-atlas/internal/ebpf"
 	"github.com/sikurdev/sikur-atlas/internal/graph"
+	"github.com/sikurdev/sikur-atlas/internal/history"
 	"github.com/sikurdev/sikur-atlas/internal/procfs"
 	"github.com/sikurdev/sikur-atlas/internal/webui"
 )
 
-var version = "0.1.0-dev" // overridden via -ldflags at release build
+var version = "0.2.0-dev" // overridden via -ldflags at release build
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:7171", "HTTP listen address for API and UI")
 	dockerSocket := flag.String("docker-socket", dockermeta.DefaultSocket, "Docker socket for container name enrichment (\"\" disables)")
 	scanInterval := flag.Duration("scan-interval", 30*time.Second, "listening-socket rescan interval")
+	dbPath := flag.String("db", "/var/lib/sikur-atlas/history.db", "path of the topology history database")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -43,12 +46,12 @@ func main() {
 		fmt.Println("atlas", version)
 		return
 	}
-	if err := run(*listen, *dockerSocket, *scanInterval); err != nil {
+	if err := run(*listen, *dockerSocket, *dbPath, *scanInterval); err != nil {
 		log.Fatalf("atlas: %v", err)
 	}
 }
 
-func run(listen, dockerSocket string, scanInterval time.Duration) error {
+func run(listen, dockerSocket, dbPath string, scanInterval time.Duration) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -65,6 +68,7 @@ func run(listen, dockerSocket string, scanInterval time.Duration) error {
 					short = short[:12]
 				}
 				store.SetContainerMeta("container:"+short, meta.Name, meta.Image)
+				store.SetComposeIdentity("container:"+short, meta.ComposeProject, meta.ComposeService)
 			})
 			go enricher.Run(ctx)
 			log.Printf("docker enrichment enabled via %s", dockerSocket)
@@ -73,7 +77,19 @@ func run(listen, dockerSocket string, scanInterval time.Duration) error {
 		}
 	}
 
-	opts := []collector.Option{}
+	// Topology history: the database behind Replay and Compare.
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		return fmt.Errorf("creating history directory: %w", err)
+	}
+	hist, err := history.Open(dbPath, store)
+	if err != nil {
+		return fmt.Errorf("opening history database: %w", err)
+	}
+	defer hist.Close()
+	go hist.Run(ctx, func(err error) { log.Printf("history: %v", err) })
+	log.Printf("topology history at %s", dbPath)
+
+	opts := []collector.Option{collector.WithRecorder(hist)}
 	if enricher != nil {
 		opts = append(opts, collector.WithContainerHook(enricher.Enqueue))
 	}
@@ -84,7 +100,7 @@ func run(listen, dockerSocket string, scanInterval time.Duration) error {
 		return fmt.Errorf("%w\n\nAtlas needs root (or CAP_BPF+CAP_PERFMON) and a kernel >= 5.8 built with BTF (/sys/kernel/btf/vmlinux)", err)
 	}
 	defer tracer.Close()
-	log.Printf("eBPF programs attached (tracepoint sock/inet_sock_set_state, kretprobe inet_csk_accept)")
+	log.Printf("eBPF programs attached (inet_sock_set_state, tcp_retransmit_skb, tcp_receive_reset, kretprobe inet_csk_accept)")
 
 	// Periodic work: correlator ticks and listening-socket scans.
 	go func() {
@@ -135,6 +151,7 @@ func run(listen, dockerSocket string, scanInterval time.Duration) error {
 			KernelDrops:      drops,
 			DecodeErrors:     decodeErrors.Load(),
 			DockerEnrichment: enricher != nil,
+			History:          true,
 		}
 	}
 
@@ -143,9 +160,16 @@ func run(listen, dockerSocket string, scanInterval time.Duration) error {
 		ui = nil
 		log.Printf("web UI not embedded in this build; API only")
 	}
+	selfExe, _ := os.Executable()
 	srv := &http.Server{
-		Addr:              listen,
-		Handler:           api.NewServer(store, metaFn, ui).Handler(),
+		Addr: listen,
+		Handler: api.NewServer(api.Config{
+			Store:   store,
+			History: hist,
+			MetaFn:  metaFn,
+			UI:      ui,
+			SelfExe: selfExe,
+		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {

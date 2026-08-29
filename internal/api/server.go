@@ -1,6 +1,6 @@
-// Package api exposes the graph over HTTP: a snapshot endpoint, a
-// Server-Sent Events stream for live updates, agent metadata, and the
-// embedded web UI.
+// Package api exposes the graph over HTTP: live snapshot + SSE stream,
+// historical reconstruction (Replay), moment comparison, the activity
+// timeline, agent metadata, and the embedded web UI.
 package api
 
 import (
@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"strconv"
 	"time"
 
+	"github.com/sikurdev/sikur-atlas/internal/appview"
 	"github.com/sikurdev/sikur-atlas/internal/graph"
+	"github.com/sikurdev/sikur-atlas/internal/history"
 )
 
 // Meta describes the running agent for /api/meta.
@@ -22,27 +25,45 @@ type Meta struct {
 	KernelDrops      uint64    `json:"kernelDrops"`
 	DecodeErrors     uint64    `json:"decodeErrors"`
 	DockerEnrichment bool      `json:"dockerEnrichment"`
+	History          bool      `json:"history"`
 }
 
-// Server wires the HTTP API. UI may be nil when no web assets are built.
+// Config wires a Server.
+type Config struct {
+	Store   *graph.Store
+	History *history.Store // nil disables replay/compare/timeline
+	MetaFn  func() Meta
+	UI      fs.FS // nil when no web assets are built
+	// SelfExe marks the agent's own executable in the application view.
+	SelfExe string
+}
+
+// Server wires the HTTP API.
 type Server struct {
-	store    *graph.Store
-	metaFn   func() Meta
-	ui       fs.FS
+	cfg      Config
 	debounce time.Duration
 	handler  http.Handler
 }
 
-func NewServer(store *graph.Store, metaFn func() Meta, ui fs.FS) *Server {
+// StreamPayload is one SSE snapshot event: the raw graph plus its
+// application-view projection, so the client renders either without a
+// second round trip.
+type StreamPayload struct {
+	Raw graph.Snapshot `json:"raw"`
+	App appview.Graph  `json:"app"`
+}
+
+func NewServer(cfg Config) *Server {
 	s := &Server{
-		store:    store,
-		metaFn:   metaFn,
-		ui:       ui,
+		cfg:      cfg,
 		debounce: 250 * time.Millisecond,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/graph", s.handleGraph)
+	mux.HandleFunc("GET /api/appview", s.handleAppView)
 	mux.HandleFunc("GET /api/stream", s.handleStream)
+	mux.HandleFunc("GET /api/timeline", s.handleTimeline)
+	mux.HandleFunc("GET /api/compare", s.handleCompare)
 	mux.HandleFunc("GET /api/meta", s.handleMeta)
 	mux.HandleFunc("/", s.handleUI)
 	s.handler = mux
@@ -52,12 +73,132 @@ func NewServer(store *graph.Store, metaFn func() Meta, ui fs.FS) *Server {
 // Handler returns the root http.Handler.
 func (s *Server) Handler() http.Handler { return s.handler }
 
-func (s *Server) handleGraph(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, s.store.Snapshot())
+// liveSnapshot returns the in-memory graph decorated with recent health
+// windows from history.
+func (s *Server) liveSnapshot() graph.Snapshot {
+	snap := s.cfg.Store.Snapshot()
+	if s.cfg.History == nil {
+		return snap
+	}
+	windows, err := s.cfg.History.WindowHealth(time.Now(), history.DefaultMetricWindow)
+	if err != nil {
+		return snap
+	}
+	for i := range snap.Edges {
+		if w, ok := windows[snap.Edges[i].ID]; ok {
+			w := w
+			snap.Edges[i].Window = &w
+		}
+	}
+	return snap
+}
+
+// snapshotFor resolves the ?at= parameter: absent means live.
+func (s *Server) snapshotFor(r *http.Request) (graph.Snapshot, bool, error) {
+	atParam := r.URL.Query().Get("at")
+	if atParam == "" {
+		return s.liveSnapshot(), true, nil
+	}
+	if s.cfg.History == nil {
+		return graph.Snapshot{}, false, fmt.Errorf("history disabled")
+	}
+	at, err := parseTime(atParam)
+	if err != nil {
+		return graph.Snapshot{}, false, err
+	}
+	snap, err := s.cfg.History.SnapshotAt(at, 0, 0)
+	return snap, false, err
+}
+
+func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
+	snap, _, err := s.snapshotFor(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, snap)
+}
+
+func (s *Server) handleAppView(w http.ResponseWriter, r *http.Request) {
+	snap, _, err := s.snapshotFor(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, appview.Project(snap, appview.Options{SelfExe: s.cfg.SelfExe}))
+}
+
+func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.History == nil {
+		http.Error(w, "history disabled", http.StatusNotFound)
+		return
+	}
+	q := r.URL.Query()
+	now := time.Now()
+	to := now
+	from := now.Add(-15 * time.Minute)
+	var err error
+	if v := q.Get("from"); v != "" {
+		if from, err = parseTime(v); err != nil {
+			http.Error(w, "bad from: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	if v := q.Get("to"); v != "" {
+		if to, err = parseTime(v); err != nil {
+			http.Error(w, "bad to: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	step := to.Sub(from) / 120
+	if v := q.Get("step"); v != "" {
+		secs, err := strconv.Atoi(v)
+		if err != nil || secs <= 0 {
+			http.Error(w, "bad step", http.StatusBadRequest)
+			return
+		}
+		step = time.Duration(secs) * time.Second
+	}
+	series, err := s.cfg.History.Timeline(from, to, step)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"from": from.Unix(), "to": to.Unix(),
+		"step": int(step.Seconds()), "buckets": series,
+	})
+}
+
+func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.History == nil {
+		http.Error(w, "history disabled", http.StatusNotFound)
+		return
+	}
+	q := r.URL.Query()
+	a, errA := parseTime(q.Get("a"))
+	b, errB := parseTime(q.Get("b"))
+	if errA != nil || errB != nil {
+		http.Error(w, "compare needs a= and b= timestamps", http.StatusBadRequest)
+		return
+	}
+	snapA, err := s.cfg.History.SnapshotAt(a, 0, 0)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	snapB, err := s.cfg.History.SnapshotAt(b, 0, 0)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	opts := appview.Options{SelfExe: s.cfg.SelfExe}
+	diff := appview.ComputeDiff(appview.Project(snapA, opts), appview.Project(snapB, opts))
+	writeJSON(w, diff)
 }
 
 func (s *Server) handleMeta(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, s.metaFn())
+	writeJSON(w, s.cfg.MetaFn())
 }
 
 // handleStream sends the current snapshot immediately, then a debounced
@@ -71,10 +212,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 
-	changes, cancel := s.store.Subscribe()
+	changes, cancel := s.cfg.Store.Subscribe()
 	defer cancel()
 
-	if err := writeSSE(w, s.store.Snapshot()); err != nil {
+	if err := s.writeStreamEvent(w); err != nil {
 		return
 	}
 	flusher.Flush()
@@ -104,7 +245,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			case <-changes: // drain anything that arrived while waiting
 			default:
 			}
-			if err := writeSSE(w, s.store.Snapshot()); err != nil {
+			if err := s.writeStreamEvent(w); err != nil {
 				return
 			}
 			flusher.Flush()
@@ -112,19 +253,33 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) writeStreamEvent(w http.ResponseWriter) error {
+	snap := s.liveSnapshot()
+	payload := StreamPayload{
+		Raw: snap,
+		App: appview.Project(snap, appview.Options{SelfExe: s.cfg.SelfExe}),
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n", data)
+	return err
+}
+
 func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
-	if s.ui == nil {
+	if s.cfg.UI == nil {
 		http.Error(w, "Atlas web UI not built — run `make web` and rebuild the agent.", http.StatusNotFound)
 		return
 	}
-	if _, err := fs.Stat(s.ui, pathFor(r.URL.Path)); err != nil {
+	if _, err := fs.Stat(s.cfg.UI, pathFor(r.URL.Path)); err != nil {
 		// SPA fallback: unknown paths get index.html.
 		r2 := *r
 		r2.URL.Path = "/"
-		http.ServeFileFS(w, &r2, s.ui, "index.html")
+		http.ServeFileFS(w, &r2, s.cfg.UI, "index.html")
 		return
 	}
-	http.ServeFileFS(w, r, s.ui, pathFor(r.URL.Path))
+	http.ServeFileFS(w, r, s.cfg.UI, pathFor(r.URL.Path))
 }
 
 func pathFor(urlPath string) string {
@@ -134,18 +289,23 @@ func pathFor(urlPath string) string {
 	return urlPath[1:]
 }
 
+// parseTime accepts unix seconds, unix milliseconds or RFC3339.
+func parseTime(v string) (time.Time, error) {
+	if v == "" {
+		return time.Time{}, fmt.Errorf("empty timestamp")
+	}
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n > 1e12 { // milliseconds
+			return time.UnixMilli(n), nil
+		}
+		return time.Unix(n, 0), nil
+	}
+	return time.Parse(time.RFC3339, v)
+}
+
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "")
 	_ = enc.Encode(v)
-}
-
-func writeSSE(w http.ResponseWriter, snap graph.Snapshot) error {
-	data, err := json.Marshal(snap)
-	if err != nil {
-		return err
-	}
-	_, err = fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n", data)
-	return err
 }
