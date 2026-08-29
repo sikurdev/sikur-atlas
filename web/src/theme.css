@@ -600,6 +600,20 @@ body {
   stroke-width: 1;
 }
 
+/* Lifecycle marker ticks along the timeline's upper edge. */
+.tl-lifecycle {
+  fill: var(--ink-soft);
+}
+
+.tl-oom {
+  fill: var(--hazard);
+}
+
+/* AF_UNIX edges: fine dotted stroke distinguishes IPC from TCP. */
+.edge.unix {
+  stroke-linecap: round;
+}
+
 .tl-cursor {
   stroke: var(--accent);
   stroke-width: 2;

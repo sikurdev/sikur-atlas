@@ -11,6 +11,17 @@ import rediswire
 
 CACHE_HOST = os.environ.get("CACHE_HOST", "cache")
 INVENTORY_URL = os.environ.get("INVENTORY_URL", "http://inventory:8000/stock")
+REPORTS_SOCK = os.environ.get("REPORTS_SOCK", "/sockets/reports.sock")
+
+
+def tally_report():
+    """One request over the shared AF_UNIX socket (real IPC edge)."""
+    import socket
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(2)
+        s.connect(REPORTS_SOCK)
+        s.sendall(b"tally\n")
+        return s.recv(256).decode(errors="replace")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -20,10 +31,15 @@ class Handler(BaseHTTPRequestHandler):
                 stock = json.load(r)
             rediswire.command(CACHE_HOST, "INCR", "orders:served")
             served = rediswire.command(CACHE_HOST, "GET", "orders:served")
+            try:
+                report = tally_report()
+            except OSError:
+                report = "unavailable"
             body = json.dumps({
                 "service": "orders",
                 "stock": stock,
                 "served": served,
+                "report": report,
             }).encode()
             status = 200
         except OSError as exc:

@@ -3,6 +3,22 @@ import { useEffect, useRef, useState } from "react";
 
 export type NodeKind = "process" | "container" | "external";
 
+export interface NodeMetrics {
+  windowSecs: number;
+  cpuMillis: number;
+  rssBytes: number;
+  ioReadBytes: number;
+  ioWriteBytes: number;
+  fds: number;
+  threads: number;
+  procs: number;
+  throttledUs: number;
+  oomKills: number;
+  memLimit: number;
+  psiCpuSomePct?: number;
+  psiMemSomePct?: number;
+}
+
 export interface NodeData {
   id: string;
   kind: NodeKind;
@@ -18,6 +34,7 @@ export interface NodeData {
   addrs?: string[];
   firstSeen: string;
   lastSeen: string;
+  metrics?: NodeMetrics;
 }
 
 export interface EdgeWindow {
@@ -40,6 +57,7 @@ export interface EdgeData {
   dst: string;
   dstPort: number;
   protocol: string;
+  path?: string;
   connections: number;
   activeConns: number;
   bytesSent: number;
@@ -74,6 +92,7 @@ export interface AppNode {
   listenPorts?: number[];
   firstSeen: string;
   lastSeen: string;
+  metrics?: NodeMetrics;
 }
 
 export interface AppEdge {
@@ -82,6 +101,7 @@ export interface AppEdge {
   dst: string;
   dstPort: number;
   protocol: string;
+  path?: string;
   connections: number;
   activeConns: number;
   bytesSent: number;
@@ -114,6 +134,21 @@ export interface EdgeChange {
   aBytesRecv: number;
 }
 
+export interface NodeChange {
+  node: AppNode;
+  changes: string[];
+  aCpuMillis: number;
+  aRssBytes: number;
+}
+
+export interface LifecycleEntry {
+  node: string;
+  label: string;
+  kind: string;
+  detail: string;
+  time: string;
+}
+
 export interface Diff {
   a: string;
   b: string;
@@ -122,6 +157,16 @@ export interface Diff {
   addedEdges: AppEdge[] | null;
   removedEdges: AppEdge[] | null;
   changedEdges: EdgeChange[] | null;
+  changedNodes: NodeChange[] | null;
+  lifecycle: LifecycleEntry[] | null;
+}
+
+export interface LifeEvent {
+  node: string;
+  kind: string;
+  pid: number;
+  detail: string;
+  time: string;
 }
 
 export interface TimelineBucket {
@@ -130,6 +175,9 @@ export interface TimelineBucket {
   closes: number;
   failures: number;
   trouble: number;
+  execs: number;
+  exits: number;
+  ooms: number;
 }
 
 export interface TimelinePayload {
@@ -246,4 +294,8 @@ export function fetchCompare(a: number, b: number): Promise<Diff> {
 
 export function fetchTimeline(from: number, to: number, step: number): Promise<TimelinePayload> {
   return getJSON(`/api/timeline?from=${from}&to=${to}&step=${step}`);
+}
+
+export function fetchLifecycle(from: number, to: number): Promise<{ events: LifeEvent[] | null }> {
+  return getJSON(`/api/lifecycle?from=${from}&to=${to}`);
 }

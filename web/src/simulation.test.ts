@@ -22,6 +22,7 @@ function g(nodes: string[], edges: [string, string][]): DisplayGraph {
       src,
       dst,
       dstPort: 80,
+      protocol: "tcp",
       connections: 1,
       activeConns: 0,
       failures: 0,

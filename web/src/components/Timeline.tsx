@@ -153,6 +153,26 @@ export function Timeline({
                   height={5}
                 />
               )}
+              {(b.execs > 0 || b.exits > 0) && (
+                <rect
+                  className="tl-lifecycle"
+                  data-testid="tl-lifecycle"
+                  x={x}
+                  y={1}
+                  width={Math.max(1, w - 1)}
+                  height={3}
+                />
+              )}
+              {b.ooms > 0 && (
+                <rect
+                  className="tl-oom"
+                  data-testid="tl-oom"
+                  x={x}
+                  y={1}
+                  width={Math.max(1.5, w - 1)}
+                  height={6}
+                />
+              )}
             </g>
           );
         })}

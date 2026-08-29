@@ -18,6 +18,8 @@ BROKEN_PORT = int(os.environ.get("BROKEN_CACHE_PORT", "6380"))
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/stress"):
+            return self.do_stress()
         try:
             rediswire.command(CACHE_HOST, "PING", port=BROKEN_PORT, timeout=0.5)
         except OSError:
@@ -31,6 +33,34 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps({"service": "users", "error": str(exc)}).encode()
             status = 502
         self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_stress(self):
+        """Deliberate memory-pressure episode: allocate ?mb= for ?sec=
+        seconds, in steps so resource sampling can observe the climb.
+        With the compose memory limit, a large enough mb gets this
+        container OOM-killed — on purpose."""
+        import time
+        from urllib.parse import parse_qs, urlparse
+
+        q = parse_qs(urlparse(self.path).query)
+        mb = int(q.get("mb", ["100"])[0])
+        sec = float(q.get("sec", ["10"])[0])
+        chunks = []
+        step = 20
+        for _ in range(0, mb, step):
+            blob = bytearray(step * 1024 * 1024)
+            for i in range(0, len(blob), 4096):
+                blob[i] = 1  # commit the pages
+            chunks.append(blob)
+            time.sleep(0.3)
+        time.sleep(sec)
+        del chunks
+        body = json.dumps({"service": "users", "stressed_mb": mb}).encode()
+        self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

@@ -27,9 +27,21 @@ services:
     command: ["python", "/app/orders.py"]
     volumes:
       - ./services:/app:ro
+      - sockets:/sockets
     depends_on:
       - cache
       - inventory
+      - reports
+
+  # Speaks AF_UNIX only: orders reaches it over a socket in a shared
+  # volume, giving Atlas a real IPC edge to discover.
+  reports:
+    image: python:3.12-alpine
+    container_name: atlas-demo-reports
+    command: ["python", "/app/reports.py"]
+    volumes:
+      - ./services:/app:ro
+      - sockets:/sockets
 
   users:
     image: python:3.12-alpine
@@ -39,6 +51,10 @@ services:
       - ./services:/app:ro
     depends_on:
       - cache
+    # The pressure-episode stage: /stress allocations run into this
+    # limit and the container is OOM-killed, then restarted.
+    mem_limit: 256m
+    restart: on-failure
 
   inventory:
     image: python:3.12-alpine
@@ -61,3 +77,6 @@ services:
       LOADGEN_INTERVAL: "0.4"
     depends_on:
       - gateway
+
+volumes:
+  sockets:

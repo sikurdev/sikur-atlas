@@ -25,7 +25,13 @@ const expectedEdges = [
   ["atlas-demo-orders", "atlas-demo-cache", 6379],
   ["atlas-demo-users", "atlas-demo-cache", 6379],
 ];
-for (const name of new Set(expectedEdges.flatMap(([a, b]) => [a, b]))) {
+const expectedUnixEdges = [
+  ["atlas-demo-orders", "atlas-demo-reports", "/sockets/reports.sock"],
+];
+for (const name of new Set([
+  ...expectedEdges.flatMap(([a, b]) => [a, b]),
+  ...expectedUnixEdges.flatMap(([a, b]) => [a, b]),
+])) {
   if (!byName.has(name)) failures.push(`node missing: ${name}`);
 }
 let edgesWithBytes = 0;
@@ -100,6 +106,60 @@ if (users && cache) {
 }
 if (!(meta.collector?.failedConns >= 1)) {
   failures.push(`collector saw no failed connects: ${JSON.stringify(meta.collector)}`);
+}
+
+// ---- AF_UNIX topology ----
+for (const [srcName, dstName, path] of expectedUnixEdges) {
+  const src = byName.get(srcName);
+  const dst = byName.get(dstName);
+  if (!src || !dst) continue;
+  const edge = graph.edges.find(
+    (e) => e.src === src.id && e.dst === dst.id && e.protocol === "unix" && e.path === path,
+  );
+  if (!edge) {
+    failures.push(`unix edge missing: ${srcName} -> ${dstName} (${path})`);
+    continue;
+  }
+  if (!(edge.connections >= 1)) {
+    failures.push(`unix edge saw no connects: ${JSON.stringify(edge)}`);
+  }
+  found.push(
+    `${srcName} -> ${dstName} [unix ${path}]  conns=${edge.connections} active=${edge.activeConns}`,
+  );
+}
+if (!(meta.collector?.unixConnects >= 1)) {
+  failures.push(`collector saw no unix connects: ${JSON.stringify(meta.collector)}`);
+}
+const appUnix = app.edges.find(
+  (e) =>
+    e.src === "svc:compose:atlas-demo/orders" &&
+    e.dst === "svc:compose:atlas-demo/reports" &&
+    e.protocol === "unix",
+);
+if (!appUnix) {
+  failures.push("app view missing orders -> reports unix edge");
+}
+
+// ---- resources ----
+const ordersSvc = appByLabelPeek("orders");
+if (!ordersSvc?.metrics) {
+  failures.push("orders service has no resource metrics");
+} else {
+  if (!(ordersSvc.metrics.rssBytes > 5 * 1024 * 1024)) {
+    failures.push(`orders RSS implausible: ${ordersSvc.metrics.rssBytes}`);
+  }
+  found.push(
+    `orders resources: cpu=${ordersSvc.metrics.cpuMillis}ms/${ordersSvc.metrics.windowSecs}s ` +
+      `rss=${(ordersSvc.metrics.rssBytes / 1048576).toFixed(0)}M procs=${ordersSvc.metrics.procs}`,
+  );
+}
+const usersSvc = appByLabelPeek("users");
+if (usersSvc?.metrics && !(usersSvc.metrics.memLimit > 0)) {
+  failures.push("users memory limit not visible in metrics");
+}
+
+function appByLabelPeek(label) {
+  return app.nodes.find((n) => n.label === label);
 }
 
 // ---- application view ----

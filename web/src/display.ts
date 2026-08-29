@@ -31,6 +31,8 @@ export interface DisplayEdge {
   src: string;
   dst: string;
   dstPort: number;
+  protocol: string;
+  path?: string;
   connections: number;
   activeConns: number;
   failures: number;
@@ -71,6 +73,8 @@ function displayEdgeFromRaw(e: EdgeData): DisplayEdge {
     src: e.src,
     dst: e.dst,
     dstPort: e.dstPort,
+    protocol: e.protocol,
+    path: e.path,
     connections: e.connections,
     activeConns: e.activeConns,
     failures: e.failures ?? 0,
@@ -108,6 +112,8 @@ function displayEdgeFromApp(e: AppEdge): DisplayEdge {
     src: e.src,
     dst: e.dst,
     dstPort: e.dstPort,
+    protocol: e.protocol,
+    path: e.path,
     connections: e.connections,
     activeConns: e.activeConns,
     failures: e.failures ?? 0,

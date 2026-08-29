@@ -1,6 +1,13 @@
 import { useEffect, useState } from "react";
 
-import { fetchCompare, type Diff, type EdgeChange, type MetaData } from "../api";
+import {
+  fetchCompare,
+  fetchLifecycle,
+  type Diff,
+  type EdgeChange,
+  type LifeEvent,
+  type MetaData,
+} from "../api";
 import type { DisplayEdge, DisplayGraph, DisplayNode } from "../display";
 import { formatAgo, formatBytes, formatCount, formatRTT, shortExe } from "../format";
 import type { Selection } from "../selection";
@@ -118,6 +125,8 @@ function NodeDetails({
   // The compare endpoint speaks service ids, so the digest only makes
   // sense in the services view.
   const changes = useRecentChanges(node.id, mode, !rawView);
+  const metrics = node.raw?.metrics ?? node.app?.metrics ?? null;
+  const life = useNodeLifecycle(node, mode);
 
   const raw = node.raw;
   const app = node.app;
@@ -205,6 +214,43 @@ function NodeDetails({
         )}
       </dl>
 
+      {metrics && metrics.windowSecs > 0 && (
+        <>
+          <h3>resources (last {metrics.windowSecs}s)</h3>
+          <dl data-testid="node-resources">
+            <dt>cpu</dt>
+            <dd>
+              {((metrics.cpuMillis / 1000 / metrics.windowSecs) * 100).toFixed(1)}%
+              {metrics.throttledUs > 0 &&
+                ` · throttled ${(metrics.throttledUs / 1000).toFixed(0)}ms`}
+            </dd>
+            <dt>memory</dt>
+            <dd className={metrics.oomKills > 0 ? "trouble" : ""}>
+              {formatBytes(metrics.rssBytes)}
+              {metrics.memLimit > 0 && ` / ${formatBytes(metrics.memLimit)}`}
+              {metrics.oomKills > 0 && ` · ${metrics.oomKills} OOM kill${metrics.oomKills > 1 ? "s" : ""}`}
+            </dd>
+            <dt>disk io</dt>
+            <dd>
+              {formatBytes(metrics.ioReadBytes)} r / {formatBytes(metrics.ioWriteBytes)} w
+            </dd>
+            <dt>procs</dt>
+            <dd>
+              {metrics.procs} · {metrics.threads} thr · {metrics.fds} fds
+            </dd>
+            {((metrics.psiCpuSomePct ?? 0) > 0 || (metrics.psiMemSomePct ?? 0) > 0) && (
+              <>
+                <dt>pressure</dt>
+                <dd>
+                  cpu {(metrics.psiCpuSomePct ?? 0).toFixed(1)}% · mem{" "}
+                  {(metrics.psiMemSomePct ?? 0).toFixed(1)}%
+                </dd>
+              </>
+            )}
+          </dl>
+        </>
+      )}
+
       {outgoing.length > 0 && (
         <>
           <h3>depends on</h3>
@@ -246,6 +292,22 @@ function NodeDetails({
         </>
       )}
 
+      {life != null && life.length > 0 && (
+        <>
+          <h3>lifecycle (last 15 min)</h3>
+          <ul className="change-list" data-testid="node-lifecycle">
+            {life.map((ev, i) => (
+              <li
+                key={i}
+                className={ev.kind === "oom" || ev.kind === "crash" ? "warn" : ""}
+              >
+                {new Date(ev.time).toLocaleTimeString()} {ev.kind} — {ev.detail}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+
       {changes != null && changes.length > 0 && (
         <>
           <h3>changes (last 10 min)</h3>
@@ -260,6 +322,34 @@ function NodeDetails({
       )}
     </>
   );
+}
+
+/** Recent lifecycle events for a node: raw nodes match directly, app
+ * nodes match through their members. Live mode only (replay uses
+ * Compare's lifecycle section). */
+function useNodeLifecycle(node: DisplayNode, mode: TimeMode): LifeEvent[] | null {
+  const [events, setEvents] = useState<LifeEvent[] | null>(null);
+  const members = node.app ? node.app.members.join(",") : node.id;
+  useEffect(() => {
+    if (mode.kind !== "live") {
+      setEvents(null);
+      return;
+    }
+    let stopped = false;
+    const now = Math.floor(Date.now() / 1000);
+    fetchLifecycle(now - 900, now)
+      .then((res) => {
+        if (stopped) return;
+        const ids = new Set(members.split(","));
+        const mine = (res.events ?? []).filter((e) => ids.has(e.node));
+        setEvents(mine.slice(-8).reverse());
+      })
+      .catch(() => setEvents(null));
+    return () => {
+      stopped = true;
+    };
+  }, [members, mode.kind]);
+  return events;
 }
 
 interface ChangeLine {
@@ -330,8 +420,10 @@ function EdgeDetails({ edge, graph }: Props & { edge: DisplayEdge }) {
         {nodesById.get(edge.src)?.label ?? edge.src} →{" "}
         {nodesById.get(edge.dst)?.label ?? edge.dst}
       </h2>
-      <div className="kind-tag">
-        observed communication · {edge.raw?.protocol ?? "tcp"} :{edge.dstPort}
+      <div className="kind-tag" data-testid="edge-kind">
+        {edge.protocol === "unix"
+          ? `unix socket · ${edge.path ?? ""}`
+          : `observed communication · ${edge.protocol || "tcp"} :${edge.dstPort}`}
         {edge.diff ? ` · ${edge.diff}` : ""}
       </div>
 
@@ -416,8 +508,11 @@ function DiffPanel({
   const addedE = diff.addedEdges ?? [];
   const removedE = diff.removedEdges ?? [];
   const changed = diff.changedEdges ?? [];
+  const changedN = diff.changedNodes ?? [];
+  const lifecycle = diff.lifecycle ?? [];
   const empty =
-    added.length + removed.length + addedE.length + removedE.length + changed.length === 0;
+    added.length + removed.length + addedE.length + removedE.length +
+      changed.length + changedN.length + lifecycle.length === 0;
 
   return (
     <>
@@ -495,9 +590,46 @@ function DiffPanel({
           </ul>
         </>
       )}
+      {changedN.length > 0 && (
+        <>
+          <h3>resources moved</h3>
+          <ul className="change-list" data-testid="diff-resources">
+            {changedN.map((c) => (
+              <li key={c.node.id} className="warn">
+                <button
+                  className="linkish"
+                  onClick={() => onSelect({ type: "node", id: c.node.id })}
+                >
+                  ~ {c.node.label} · {c.changes.join(", ")}
+                  {c.changes.includes("rss") &&
+                    ` (${formatBytes(c.aRssBytes)} → ${formatBytes(c.node.metrics?.rssBytes ?? 0)})`}
+                  {c.changes.includes("cpu") &&
+                    ` (cpu ${c.aCpuMillis}ms → ${c.node.metrics?.cpuMillis ?? 0}ms)`}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {lifecycle.length > 0 && (
+        <>
+          <h3>lifecycle</h3>
+          <ul className="change-list" data-testid="diff-lifecycle">
+            {lifecycle.map((e, i) => (
+              <li
+                key={i}
+                className={e.kind === "oom" || e.kind === "crash" ? "warn" : ""}
+              >
+                {new Date(e.time).toLocaleTimeString()} {e.label} · {e.kind}
+                {e.detail ? ` — ${e.detail}` : ""}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
       <p className="legend-note">
-        Every entry is computed from recorded connection evidence; nothing
-        here is inferred or guessed.
+        Every entry is computed from recorded connection, lifecycle and
+        resource evidence; nothing here is inferred or guessed.
       </p>
     </>
   );

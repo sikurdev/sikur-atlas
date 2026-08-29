@@ -19,6 +19,7 @@ function graph(edges: [string, string][]): DisplayGraph {
       src,
       dst,
       dstPort: 1,
+      protocol: "tcp",
       connections: 1,
       activeConns: 0,
       failures: 0,

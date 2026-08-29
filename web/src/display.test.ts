@@ -127,6 +127,8 @@ describe("fromDiff", () => {
           dst: "svc:compose:demo/inventory",
         },
       ],
+      changedNodes: [],
+      lifecycle: [],
       changedEdges: [
         {
           edge: b.edges[0]!,

@@ -133,8 +133,9 @@ func run(listen, dockerSocket, dbPath string, scanInterval time.Duration) error 
 			}
 			corr.SyncListeners(listeners, time.Now())
 			// AF_UNIX topology: exact peer pairing from the kernel's
-			// own socket table.
-			if socks, err := unixdiag.Dump(); err == nil {
+			// own socket table, dumped in every network namespace
+			// (container sockets are invisible from the host's).
+			if socks, err := unixdiag.DumpAll(res.NetNSPids); err == nil {
 				corr.SyncUnixTopology(socks, res.InodeToPID, time.Now())
 			} else {
 				log.Printf("unix diag: %v", err)

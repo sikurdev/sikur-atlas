@@ -375,12 +375,14 @@ function EdgePath({
 
   const troubled = edgeTroubled(edge) || edge.diff === "removed";
   const highlight = selected || touching;
+  const isUnix = edge.protocol === "unix";
   const cls = [
     "edge",
     selected && "selected",
     touching && "touching",
     dimmed && "dimmed",
     troubled && "troubled",
+    isUnix && "unix",
     edge.diff && `diff-${edge.diff}`,
     edge.activeConns > 0 && "active",
   ]
@@ -400,7 +402,13 @@ function EdgePath({
         strokeWidth={edgeWidth(edge.connections)}
         markerEnd={marker}
         strokeDasharray={
-          edge.diff === "removed" ? "3 5" : recent && !highlight ? "7 3" : undefined
+          edge.diff === "removed"
+            ? "3 5"
+            : isUnix
+              ? "2 4"
+              : recent && !highlight
+                ? "7 3"
+                : undefined
         }
       />
       <path
@@ -413,7 +421,7 @@ function EdgePath({
       />
       {(highlight || edge.diff === "changed") && (
         <text className="edge-label" x={cx} y={cy - 6}>
-          :{edge.dstPort}
+          {isUnix ? (edge.path ?? "unix") : `:${edge.dstPort}`}
           {highlight ? ` · ${edge.connections} conn` : ""}
           {edge.diff === "changed" ? " · changed" : ""}
         </text>

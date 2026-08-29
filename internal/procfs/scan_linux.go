@@ -68,6 +68,10 @@ type ScanResult struct {
 	// InodeToPID maps any socket inode (TCP and unix alike) to the
 	// first process found holding it.
 	InodeToPID map[uint64]uint32
+	// NetNSPids holds one representative pid per network namespace.
+	// AF_UNIX sockets are only visible to a sock_diag dump made from
+	// their own namespace, so the dump must visit each of these.
+	NetNSPids []uint32
 }
 
 // ScanSockets walks /proc once and returns every listening TCP socket
@@ -108,6 +112,11 @@ func ScanSockets() ScanResult {
 		}
 	}
 
+	nsPids := make([]uint32, 0, len(nsRep))
+	for _, rep := range nsRep {
+		nsPids = append(nsPids, rep)
+	}
+
 	var out []Listener
 	commCache := make(map[uint32]string)
 	for _, rep := range nsRep {
@@ -132,7 +141,7 @@ func ScanSockets() ScanResult {
 			}
 		}
 	}
-	return ScanResult{Listeners: out, InodeToPID: inodeToPID}
+	return ScanResult{Listeners: out, InodeToPID: inodeToPID, NetNSPids: nsPids}
 }
 
 func listPIDs() []uint32 {

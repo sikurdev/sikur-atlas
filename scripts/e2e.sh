@@ -70,10 +70,26 @@ echo "== era A: letting traffic flow (45s) =="
 sleep 45
 T1=$(date +%s)
 
-echo "== phase 1: live topology, health, application view =="
+echo "== phase 1: live topology, health, unix IPC, resources, app view =="
 node scripts/assert-graph.mjs "$BASE_URL"
 
-echo "== lifecycle change: stopping inventory =="
+echo "== lifecycle episode: restarting inventory =="
+docker compose -f demo/docker-compose.yml restart -t 2 inventory
+
+echo "== pressure episode: sustained RSS climb, then an OOM kill =="
+# Hold ~200M inside the 256M limit long enough for the 10s sampler.
+curl -s -m 30 "http://127.0.0.1:8080/users/stress?mb=200&sec=14" >/dev/null || true
+# Then exceed the limit: the kernel OOM-kills the container and docker
+# restarts it (restart: on-failure).
+curl -s -m 25 "http://127.0.0.1:8080/users/stress?mb=300&sec=5" >/dev/null || true
+
+echo "== letting the restarts settle and the sampler flush (30s) =="
+sleep 30
+
+echo "== phase 1b: lifecycle + resource evidence =="
+node scripts/assert-v3.mjs "$BASE_URL" "$T1"
+
+echo "== dependency change: stopping inventory =="
 docker compose -f demo/docker-compose.yml stop -t 2 inventory
 
 echo "== era B: letting the change age past the presence window (130s) =="
@@ -109,6 +125,17 @@ if [ "$POST_RESTART" != "ok" ]; then
     exit 1
 fi
 echo "post-restart era reconstructs from newly recorded history"
+
+echo "== atlas top: terminal client smoke test =="
+TOP_OUT=$(./bin/atlas top --once --url "$BASE_URL")
+echo "$TOP_OUT" | head -12
+for want in "ATLAS TOP" "SERVICE" "CPU%" "gateway" "orders"; do
+    if ! echo "$TOP_OUT" | grep -q "$want"; then
+        echo "atlas top output missing: $want"
+        exit 1
+    fi
+done
+echo "atlas top OK"
 
 if [ "${ATLAS_E2E_UI:-1}" != "0" ]; then
     echo "== UI end-to-end (headless chromium) =="

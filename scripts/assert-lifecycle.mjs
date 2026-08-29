@@ -65,6 +65,23 @@ if (removedIDs.includes("svc:compose:atlas-demo/gateway")) {
   failures.push("compare: gateway wrongly reported removed");
 }
 
+// Compare carries the recorded lifecycle evidence between the moments.
+const lifeKinds = new Set((diff.lifecycle ?? []).map((e) => e.kind));
+if (!lifeKinds.has("oom")) {
+  failures.push(`compare lifecycle misses the OOM: ${[...lifeKinds]}`);
+}
+if (!lifeKinds.has("exec")) {
+  failures.push(`compare lifecycle misses restart execs: ${[...lifeKinds]}`);
+}
+const oomEntry = (diff.lifecycle ?? []).find((e) => e.kind === "oom");
+if (oomEntry && oomEntry.label !== "users") {
+  failures.push(`OOM attributed to ${oomEntry.label}, want users`);
+}
+console.log(
+  "compare lifecycle:",
+  JSON.stringify((diff.lifecycle ?? []).map((e) => `${e.label}:${e.kind}`)),
+);
+
 // The timeline must carry the recorded activity across both eras.
 const tl = await getJSON(
   `${base}/api/timeline?from=${t1 - 60}&to=${t2}&step=10`,

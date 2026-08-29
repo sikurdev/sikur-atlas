@@ -57,6 +57,34 @@ try {
   await page.waitForSelector('[data-testid="deps-in"]', { timeout: 5000 });
   ok("inspector shows node identity and dependants");
 
+  // Resource evidence renders for the selected service.
+  await page.waitForSelector('[data-testid="node-resources"]', { timeout: 10000 });
+  const resources = await page.getByTestId("node-resources").innerText();
+  if (!resources.includes("%") || !resources.includes("procs")) {
+    throw new Error(`resources section incomplete: ${resources}`);
+  }
+  ok("inspector shows sampled resources (cpu/memory/procs)");
+
+  // AF_UNIX IPC: reports is only reachable over its socket; the edge
+  // must render and identify itself with the socket path.
+  await page
+    .locator('[data-testid="node"]', { hasText: "reports" })
+    .first()
+    .locator(".symbol")
+    .first()
+    .click({ force: true });
+  await page.waitForSelector('[data-testid="deps-in"]', { timeout: 5000 });
+  await page.locator('[data-testid="deps-in"] button').first().click();
+  await page.waitForSelector('[data-testid="inspector-edge"]', { timeout: 5000 });
+  const edgeKind = await page.getByTestId("edge-kind").innerText();
+  if (!edgeKind.includes("unix socket") || !edgeKind.includes("/sockets/reports.sock")) {
+    throw new Error(`unix edge not identified: ${edgeKind}`);
+  }
+  ok("unix IPC edge renders with its socket path");
+
+  // Back to a node selection for the focus check.
+  await cacheNode.locator(".symbol").first().click({ force: true });
+  await page.waitForSelector('[data-testid="inspector-node"]', { timeout: 5000 });
   await page.getByTestId("btn-focus").click();
   await page.waitForFunction(
     () => document.querySelectorAll(".node.dimmed").length >= 1,
@@ -86,6 +114,15 @@ try {
     { timeout: 15000 },
   );
   ok("timeline strip renders recorded activity");
+  await page.waitForFunction(
+    () =>
+      document.querySelectorAll('[data-testid="tl-lifecycle"]').length +
+        document.querySelectorAll('[data-testid="tl-oom"]').length >=
+      1,
+    undefined,
+    { timeout: 10000 },
+  );
+  ok("timeline shows lifecycle markers (restart/OOM episodes)");
 
   if (t1 != null) {
     // ---- Replay at T1: the stopped service is back on screen ----
@@ -113,6 +150,11 @@ try {
     if (!removed.includes("inventory")) {
       throw new Error(`compare panel misses inventory: ${removed}`);
     }
+    const diffLife = await page.getByTestId("diff-lifecycle").innerText();
+    if (!diffLife.includes("oom")) {
+      throw new Error(`compare lifecycle misses the OOM: ${diffLife}`);
+    }
+    ok("compare lists recorded lifecycle evidence (OOM, restarts)");
     await page
       .locator('[data-testid="node"][data-diff="removed"]')
       .first()
