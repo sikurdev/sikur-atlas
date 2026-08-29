@@ -52,8 +52,11 @@ services:
     depends_on:
       - cache
     # The pressure-episode stage: /stress allocations run into this
-    # limit and the container is OOM-killed, then restarted.
+    # limit and the container is OOM-killed, then restarted. memswap
+    # must equal the limit — with the default swap headroom the kernel
+    # swaps instead of killing and no OOM ever happens.
     mem_limit: 256m
+    memswap_limit: 256m
     restart: on-failure
 
   inventory:
