@@ -223,13 +223,16 @@ export function GraphCanvas({ snapshot, selection, onSelect, query }: Props) {
           >
             <circle cx="1" cy="1" r="1" fill="var(--line-faint)" />
           </pattern>
+          {/* userSpaceOnUse keeps arrowheads a constant size instead of
+              scaling with edge width. */}
           <marker
             id="arrow"
             viewBox="0 0 8 8"
             refX="7"
             refY="4"
-            markerWidth="7"
-            markerHeight="7"
+            markerWidth="9"
+            markerHeight="9"
+            markerUnits="userSpaceOnUse"
             orient="auto-start-reverse"
           >
             <path d="M0,0.6 L7.2,4 L0,7.4 z" fill="var(--water)" />
@@ -239,8 +242,9 @@ export function GraphCanvas({ snapshot, selection, onSelect, query }: Props) {
             viewBox="0 0 8 8"
             refX="7"
             refY="4"
-            markerWidth="7"
-            markerHeight="7"
+            markerWidth="9"
+            markerHeight="9"
+            markerUnits="userSpaceOnUse"
             orient="auto-start-reverse"
           >
             <path d="M0,0.6 L7.2,4 L0,7.4 z" fill="var(--accent)" />
