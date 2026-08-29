@@ -1,0 +1,18 @@
+# Build outputs
+/bin/
+/web/dist/
+/web/node_modules/
+/coverage/
+*.test
+internal/ebpf/obj/*
+!internal/ebpf/obj/.gitkeep
+internal/webui/dist/*
+!internal/webui/dist/.gitkeep
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local state
+atlas-state.json

@@ -1,0 +1,324 @@
+package collector
+
+import (
+	"net/netip"
+	"testing"
+	"time"
+
+	"github.com/sikurdev/sikur-atlas/internal/graph"
+	"github.com/sikurdev/sikur-atlas/internal/model"
+)
+
+type fakeResolver map[uint32]model.ProcessInfo
+
+func (f fakeResolver) Resolve(pid uint32, comm string) model.ProcessInfo {
+	if info, ok := f[pid]; ok {
+		return info
+	}
+	return model.ProcessInfo{PID: pid, Comm: comm}
+}
+
+var base = time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+
+func ap(addr string, port uint16) netip.AddrPort {
+	return netip.AddrPortFrom(netip.MustParseAddr(addr), port)
+}
+
+func ev(t model.EventType, sock uint64, pid uint32, comm string, src, dst netip.AddrPort, offsetMs int) model.ConnEvent {
+	return model.ConnEvent{
+		Time:   base.Add(time.Duration(offsetMs) * time.Millisecond),
+		Type:   t,
+		PID:    pid,
+		Comm:   comm,
+		SockID: sock,
+		Src:    src,
+		Dst:    dst,
+	}
+}
+
+func newTestCorrelator(res ProcessResolver) (*Correlator, *graph.Store) {
+	store := graph.NewStore()
+	c := New(store, res, WithGracePeriod(time.Second))
+	return c, store
+}
+
+func edgeByID(t *testing.T, s *graph.Store, id string) graph.Edge {
+	t.Helper()
+	for _, e := range s.Snapshot().Edges {
+		if e.ID == id {
+			return e
+		}
+	}
+	t.Fatalf("edge %q not found; have %+v", id, s.Snapshot().Edges)
+	return graph.Edge{}
+}
+
+// The canonical loopback flow: both socket halves observed, merged into a
+// single process→process edge.
+func TestLoopbackConnectionMergesToOneEdge(t *testing.T) {
+	res := fakeResolver{
+		100: {PID: 100, Comm: "curl", Exe: "/usr/bin/curl"},
+		200: {PID: 200, Comm: "nginx", Exe: "/usr/sbin/nginx"},
+	}
+	c, store := newTestCorrelator(res)
+
+	cli := ap("127.0.0.1", 41000)
+	srv := ap("127.0.0.1", 8080)
+
+	c.HandleEvent(ev(model.EventOpen, 1, 100, "curl", netip.AddrPort{}, srv, 0))
+	c.HandleEvent(ev(model.EventEstablished, 1, 0, "", cli, srv, 1))
+	c.HandleEvent(ev(model.EventEstablished, 2, 0, "", srv, cli, 2))
+	c.HandleEvent(ev(model.EventAccept, 2, 200, "nginx", srv, cli, 3))
+
+	snap := store.Snapshot()
+	if len(snap.Edges) != 1 {
+		t.Fatalf("edges = %d, want 1 (halves must merge); %+v", len(snap.Edges), snap.Edges)
+	}
+	e := snap.Edges[0]
+	if e.Src != "proc:/usr/bin/curl" || e.Dst != "proc:/usr/sbin/nginx" || e.DstPort != 8080 {
+		t.Fatalf("unexpected edge %+v", e)
+	}
+	if e.ActiveConns != 1 || e.Connections != 1 {
+		t.Fatalf("counts %d/%d, want 1/1", e.Connections, e.ActiveConns)
+	}
+
+	// Close both halves; bytes counted once, from the client's view.
+	closeEv := ev(model.EventClose, 1, 0, "", cli, srv, 500)
+	closeEv.BytesSent, closeEv.BytesRecv = 500, 1000
+	c.HandleEvent(closeEv)
+	closeEv2 := ev(model.EventClose, 2, 0, "", srv, cli, 501)
+	closeEv2.BytesSent, closeEv2.BytesRecv = 1000, 500
+	c.HandleEvent(closeEv2)
+
+	e = edgeByID(t, store, e.ID)
+	if e.ActiveConns != 0 {
+		t.Fatalf("active = %d, want 0", e.ActiveConns)
+	}
+	if e.BytesSent != 500 || e.BytesRecv != 1000 {
+		t.Fatalf("bytes = %d/%d, want 500/1000 (counted once, client view)", e.BytesSent, e.BytesRecv)
+	}
+
+	st := c.Stats()
+	if st.LiveSockets != 0 || st.LiveRecords != 0 {
+		t.Fatalf("state leaked: %+v", st)
+	}
+}
+
+// Outbound connection to a peer that is not on this host: after the grace
+// period the peer becomes an external node.
+func TestOutboundToExternalPeer(t *testing.T) {
+	res := fakeResolver{100: {PID: 100, Comm: "curl", Exe: "/usr/bin/curl"}}
+	c, store := newTestCorrelator(res)
+
+	cli := ap("10.0.0.5", 52000)
+	srv := ap("93.184.216.34", 443)
+
+	c.HandleEvent(ev(model.EventOpen, 1, 100, "curl", netip.AddrPort{}, srv, 0))
+	c.HandleEvent(ev(model.EventEstablished, 1, 0, "", cli, srv, 1))
+
+	if n := len(store.Snapshot().Edges); n != 0 {
+		t.Fatalf("edge materialized before grace period: %d", n)
+	}
+	c.Tick(base.Add(2 * time.Second))
+
+	snap := store.Snapshot()
+	if len(snap.Edges) != 1 {
+		t.Fatalf("edges = %d, want 1", len(snap.Edges))
+	}
+	e := snap.Edges[0]
+	if e.Src != "proc:/usr/bin/curl" || e.Dst != "ext:93.184.216.34" || e.DstPort != 443 {
+		t.Fatalf("unexpected edge %+v", e)
+	}
+
+	closeEv := ev(model.EventClose, 1, 0, "", cli, srv, 3000)
+	closeEv.BytesSent, closeEv.BytesRecv = 111, 2222
+	c.HandleEvent(closeEv)
+	e = edgeByID(t, store, e.ID)
+	if e.BytesSent != 111 || e.BytesRecv != 2222 || e.ActiveConns != 0 {
+		t.Fatalf("close not folded: %+v", e)
+	}
+}
+
+// Inbound connection from off-host: server side resolves, client becomes
+// external.
+func TestInboundFromExternalPeer(t *testing.T) {
+	res := fakeResolver{200: {PID: 200, Comm: "nginx", Exe: "/usr/sbin/nginx"}}
+	c, store := newTestCorrelator(res)
+
+	local := ap("10.0.0.5", 8080)
+	peer := ap("198.51.100.7", 55555)
+
+	c.HandleEvent(ev(model.EventEstablished, 9, 0, "", local, peer, 0))
+	c.HandleEvent(ev(model.EventAccept, 9, 200, "nginx", local, peer, 1))
+
+	// Client half can never appear (it is off-host); grace must expire.
+	c.Tick(base.Add(2 * time.Second))
+
+	snap := store.Snapshot()
+	if len(snap.Edges) != 1 {
+		t.Fatalf("edges = %d, want 1", len(snap.Edges))
+	}
+	e := snap.Edges[0]
+	if e.Src != "ext:198.51.100.7" || e.Dst != "proc:/usr/sbin/nginx" || e.DstPort != 8080 {
+		t.Fatalf("unexpected edge %+v", e)
+	}
+}
+
+// A connect that never completes must not create graph state.
+func TestFailedConnectLeavesNoTrace(t *testing.T) {
+	c, store := newTestCorrelator(fakeResolver{})
+
+	c.HandleEvent(ev(model.EventOpen, 1, 100, "curl", netip.AddrPort{}, ap("10.9.9.9", 81), 0))
+	c.HandleEvent(ev(model.EventClose, 1, 0, "", netip.AddrPort{}, ap("10.9.9.9", 81), 100))
+
+	if n := len(store.Snapshot().Nodes); n != 0 {
+		t.Fatalf("nodes = %d, want 0", n)
+	}
+	st := c.Stats()
+	if st.LiveSockets != 0 || st.LiveRecords != 0 {
+		t.Fatalf("state leaked: %+v", st)
+	}
+}
+
+// Under load the client can close before the server's accept() returns.
+// The close must wait for the accept so the server is not misattributed
+// as external, and the active counter must not go phantom-positive.
+func TestClientCloseBeforeAccept(t *testing.T) {
+	res := fakeResolver{
+		100: {PID: 100, Comm: "curl", Exe: "/usr/bin/curl"},
+		200: {PID: 200, Comm: "nginx", Exe: "/usr/sbin/nginx"},
+	}
+	c, store := newTestCorrelator(res)
+
+	cli := ap("127.0.0.1", 41000)
+	srv := ap("127.0.0.1", 8080)
+
+	c.HandleEvent(ev(model.EventOpen, 1, 100, "curl", netip.AddrPort{}, srv, 0))
+	c.HandleEvent(ev(model.EventEstablished, 1, 0, "", cli, srv, 1))
+	c.HandleEvent(ev(model.EventEstablished, 2, 0, "", srv, cli, 2))
+
+	closeEv := ev(model.EventClose, 1, 0, "", cli, srv, 10)
+	closeEv.BytesSent, closeEv.BytesRecv = 300, 900
+	c.HandleEvent(closeEv)
+
+	if n := len(store.Snapshot().Edges); n != 0 {
+		t.Fatalf("edge materialized from a stale half: %d", n)
+	}
+
+	c.HandleEvent(ev(model.EventAccept, 2, 200, "nginx", srv, cli, 20))
+
+	snap := store.Snapshot()
+	if len(snap.Edges) != 1 {
+		t.Fatalf("edges = %d, want 1", len(snap.Edges))
+	}
+	e := snap.Edges[0]
+	if e.Dst != "proc:/usr/sbin/nginx" {
+		t.Fatalf("server misattributed: %+v", e)
+	}
+	if e.ActiveConns != 0 {
+		t.Fatalf("active = %d, want 0 (stashed close must apply on materialize)", e.ActiveConns)
+	}
+	if e.BytesSent != 300 || e.BytesRecv != 900 {
+		t.Fatalf("bytes = %d/%d, want 300/900", e.BytesSent, e.BytesRecv)
+	}
+}
+
+// Containerized processes become container nodes and fire the enrichment
+// hook exactly once per container.
+func TestContainerAttribution(t *testing.T) {
+	cid := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	res := fakeResolver{
+		300: {PID: 300, Comm: "python3", Exe: "/usr/local/bin/python3.12", ContainerID: cid},
+		100: {PID: 100, Comm: "curl", Exe: "/usr/bin/curl"},
+	}
+	var hooked []string
+	store := graph.NewStore()
+	c := New(store, res, WithGracePeriod(time.Second), WithContainerHook(func(id string) {
+		hooked = append(hooked, id)
+	}))
+
+	srv := ap("172.17.0.2", 8000)
+	for i := 0; i < 2; i++ {
+		cli := ap("172.17.0.1", uint16(41000+i))
+		sockA, sockB := uint64(10+i*2), uint64(11+i*2)
+		c.HandleEvent(ev(model.EventOpen, sockA, 100, "curl", netip.AddrPort{}, srv, i*100))
+		c.HandleEvent(ev(model.EventEstablished, sockA, 0, "", cli, srv, i*100+1))
+		c.HandleEvent(ev(model.EventAccept, sockB, 300, "python3", srv, cli, i*100+2))
+	}
+
+	snap := store.Snapshot()
+	var node *graph.Node
+	for i := range snap.Nodes {
+		if snap.Nodes[i].Kind == graph.NodeContainer {
+			node = &snap.Nodes[i]
+		}
+	}
+	if node == nil {
+		t.Fatalf("no container node: %+v", snap.Nodes)
+	}
+	if node.ID != "container:0123456789ab" || node.ContainerID != cid {
+		t.Fatalf("unexpected container node %+v", node)
+	}
+	if len(hooked) != 1 || hooked[0] != cid {
+		t.Fatalf("hook fired %v, want once with %s", hooked, cid)
+	}
+
+	e := snap.Edges[0]
+	if e.Connections != 2 {
+		t.Fatalf("connections = %d, want 2", e.Connections)
+	}
+}
+
+// A socket that reaches ESTABLISHED with no open and no accept (the app
+// never called accept before grace expiry) is attributed as server via
+// the orientation hint.
+func TestOrientationHintForUnaccepted(t *testing.T) {
+	c, store := newTestCorrelator(fakeResolver{})
+
+	local := ap("10.0.0.5", 8080)
+	peer := ap("198.51.100.7", 55555)
+	c.HandleEvent(ev(model.EventEstablished, 9, 0, "", local, peer, 0))
+	c.Tick(base.Add(2 * time.Second))
+
+	snap := store.Snapshot()
+	if len(snap.Edges) != 1 {
+		t.Fatalf("edges = %d, want 1", len(snap.Edges))
+	}
+	e := snap.Edges[0]
+	if e.DstPort != 8080 {
+		t.Fatalf("hint ignored, edge %+v", e)
+	}
+	if e.Src != "ext:198.51.100.7" {
+		t.Fatalf("client side wrong: %+v", e)
+	}
+}
+
+func TestObserveListen(t *testing.T) {
+	res := fakeResolver{200: {PID: 200, Comm: "nginx", Exe: "/usr/sbin/nginx"}}
+	c, store := newTestCorrelator(res)
+
+	c.ObserveListen(200, "nginx", netip.MustParseAddr("0.0.0.0"), 8080, base)
+
+	snap := store.Snapshot()
+	if len(snap.Nodes) != 1 {
+		t.Fatalf("nodes = %d, want 1", len(snap.Nodes))
+	}
+	n := snap.Nodes[0]
+	if n.ID != "proc:/usr/sbin/nginx" || len(n.ListenPorts) != 1 || n.ListenPorts[0] != 8080 {
+		t.Fatalf("unexpected node %+v", n)
+	}
+}
+
+// Stale tracking state from lost close events is swept.
+func TestIdleSweep(t *testing.T) {
+	store := graph.NewStore()
+	c := New(store, fakeResolver{}, WithIdleTTL(time.Minute))
+
+	c.HandleEvent(ev(model.EventOpen, 1, 100, "curl", netip.AddrPort{}, ap("10.9.9.9", 81), 0))
+	c.Tick(base.Add(2 * time.Minute))
+
+	st := c.Stats()
+	if st.LiveSockets != 0 {
+		t.Fatalf("stale socket survived sweep: %+v", st)
+	}
+}
