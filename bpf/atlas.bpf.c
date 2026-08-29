@@ -140,9 +140,11 @@ int atlas_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 	e->sport = ctx->sport; /* tracepoint stores host byte order */
 	e->dport = ctx->dport;
 	/* saddr_v6/daddr_v6 carry the v4-mapped form for AF_INET, so one copy
-	 * covers both families. */
-	__builtin_memcpy(e->saddr, ctx->saddr_v6, 16);
-	__builtin_memcpy(e->daddr, ctx->daddr_v6, 16);
+	 * covers both families. A plain memcpy compiles into loads through a
+	 * modified ctx pointer, which the verifier rejects; probe_read is the
+	 * sanctioned way to copy arrays out of tracepoint context. */
+	bpf_probe_read_kernel(e->saddr, sizeof(e->saddr), ctx->saddr_v6);
+	bpf_probe_read_kernel(e->daddr, sizeof(e->daddr), ctx->daddr_v6);
 
 	if (type == ATLAS_EV_OPEN) {
 		/* connect() runs in the owning process context. */
