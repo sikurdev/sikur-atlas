@@ -187,20 +187,25 @@ describe("fromRaw", () => {
 });
 
 describe("edgeTroubled", () => {
+  const quietWindow = {
+    seconds: 60, opens: 0, closes: 0, failures: 0, resets: 0,
+    retransmits: 0, bytesSent: 0, bytesRecv: 0, rttAvgUs: 0,
+    rttMaxUs: 0, activeEnd: 0,
+  };
   it("prefers window trouble over lifetime counters", () => {
     const base = fromApp(appGraph()).edges[0]!;
     expect(edgeTroubled(base)).toBe(false);
     expect(edgeTroubled({ ...base, failures: 3 })).toBe(true);
+    // old failures, quiet window
+    expect(edgeTroubled({ ...base, failures: 3, window: quietWindow })).toBe(false);
+  });
+  it("does not redden edges for resets alone", () => {
+    const base = fromApp(appGraph()).edges[0]!;
     expect(
-      edgeTroubled({
-        ...base,
-        failures: 3,
-        window: {
-          seconds: 60, opens: 0, closes: 0, failures: 0, resets: 0,
-          retransmits: 0, bytesSent: 0, bytesRecv: 0, rttAvgUs: 0,
-          rttMaxUs: 0, activeEnd: 0,
-        },
-      }),
-    ).toBe(false); // old failures, quiet window
+      edgeTroubled({ ...base, window: { ...quietWindow, resets: 12 } }),
+    ).toBe(false);
+    expect(
+      edgeTroubled({ ...base, window: { ...quietWindow, failures: 1 } }),
+    ).toBe(true);
   });
 });

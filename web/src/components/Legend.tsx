@@ -55,7 +55,7 @@ export function Legend() {
         <svg width="30" height="14">
           <line x1="2" y1="7" x2="28" y2="7" stroke="var(--hazard)" strokeWidth="3" />
         </svg>
-        failures / resets in window
+        failed connects in window
       </div>
       <p className="legend-note">
         Click a node or edge to inspect it. Focus dims everything outside

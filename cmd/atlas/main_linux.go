@@ -32,7 +32,7 @@ import (
 	"github.com/sikurdev/sikur-atlas/internal/webui"
 )
 
-var version = "0.2.0-dev" // overridden via -ldflags at release build
+var version = "0.2.0" // overridden via -ldflags at release build
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:7171", "HTTP listen address for API and UI")

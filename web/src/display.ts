@@ -230,10 +230,12 @@ export function computeFocus(g: DisplayGraph, nodeId: string): FocusSets {
   };
 }
 
-/** True when an edge saw trouble (failures, resets) in the shown data. */
+/** True when an edge saw real trouble in the shown data. Only failed
+ * connects qualify: resets are frequently benign teardown artifacts, so
+ * they show in the inspector and diffs but never paint an edge red. */
 export function edgeTroubled(e: DisplayEdge): boolean {
   if (e.window) {
-    return e.window.failures > 0 || e.window.resets > 0;
+    return e.window.failures > 0;
   }
-  return e.failures > 0 || e.resets > 0;
+  return e.failures > 0;
 }
