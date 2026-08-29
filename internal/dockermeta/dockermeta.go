@@ -17,25 +17,31 @@ import (
 
 // Meta is the subset of container metadata Atlas uses.
 type Meta struct {
-	Name  string
-	Image string
+	Name           string
+	Image          string
+	ComposeProject string
+	ComposeService string
 }
 
 // ParseContainerInspect extracts Meta from a /containers/<id>/json
-// response body.
+// response body. Docker Compose identity comes from the standard labels
+// compose sets on every container it manages.
 func ParseContainerInspect(data []byte) (Meta, error) {
 	var payload struct {
 		Name   string `json:"Name"`
 		Config struct {
-			Image string `json:"Image"`
+			Image  string            `json:"Image"`
+			Labels map[string]string `json:"Labels"`
 		} `json:"Config"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return Meta{}, err
 	}
 	return Meta{
-		Name:  strings.TrimPrefix(payload.Name, "/"),
-		Image: payload.Config.Image,
+		Name:           strings.TrimPrefix(payload.Name, "/"),
+		Image:          payload.Config.Image,
+		ComposeProject: payload.Config.Labels["com.docker.compose.project"],
+		ComposeService: payload.Config.Labels["com.docker.compose.service"],
 	}, nil
 }
 

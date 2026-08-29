@@ -12,7 +12,15 @@ import (
 const inspectBody = `{
   "Id": "4a1f3c9b8d2e4a1f3c9b8d2e4a1f3c9b8d2e4a1f3c9b8d2e4a1f3c9b8d2e4a1f",
   "Name": "/atlas-demo-gateway",
-  "Config": {"Image": "nginx:1.27-alpine", "Env": ["PATH=/usr/bin"]}
+  "Config": {
+    "Image": "nginx:1.27-alpine",
+    "Env": ["PATH=/usr/bin"],
+    "Labels": {
+      "com.docker.compose.project": "atlas-demo",
+      "com.docker.compose.service": "gateway",
+      "com.docker.compose.container-number": "1"
+    }
+  }
 }`
 
 func TestParseContainerInspect(t *testing.T) {
@@ -26,9 +34,18 @@ func TestParseContainerInspect(t *testing.T) {
 	if meta.Image != "nginx:1.27-alpine" {
 		t.Fatalf("image = %q", meta.Image)
 	}
+	if meta.ComposeProject != "atlas-demo" || meta.ComposeService != "gateway" {
+		t.Fatalf("compose identity = %q/%q", meta.ComposeProject, meta.ComposeService)
+	}
 
 	if _, err := ParseContainerInspect([]byte("not json")); err == nil {
 		t.Fatal("invalid JSON must error")
+	}
+
+	// Containers outside compose have no labels; must not error.
+	plain, err := ParseContainerInspect([]byte(`{"Name":"/x","Config":{"Image":"redis"}}`))
+	if err != nil || plain.ComposeService != "" {
+		t.Fatalf("plain container: %+v, %v", plain, err)
 	}
 }
 

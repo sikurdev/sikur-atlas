@@ -61,12 +61,19 @@ func NewTracer() (*Tracer, error) {
 		}
 	}()
 
-	tp, err := link.Tracepoint("sock", "inet_sock_set_state",
-		coll.Programs["atlas_sock_set_state"], nil)
-	if err != nil {
-		return nil, fmt.Errorf("attaching tracepoint sock/inet_sock_set_state: %w", err)
+	for _, tp := range []struct {
+		group, name, prog string
+	}{
+		{"sock", "inet_sock_set_state", "atlas_sock_set_state"},
+		{"tcp", "tcp_retransmit_skb", "atlas_tcp_retransmit"},
+		{"tcp", "tcp_receive_reset", "atlas_tcp_receive_reset"},
+	} {
+		l, err := link.Tracepoint(tp.group, tp.name, coll.Programs[tp.prog], nil)
+		if err != nil {
+			return nil, fmt.Errorf("attaching tracepoint %s/%s: %w", tp.group, tp.name, err)
+		}
+		t.links = append(t.links, l)
 	}
-	t.links = append(t.links, tp)
 
 	// Raise maxactive: with the default, a burst of parallel accept()
 	// returns exhausts kretprobe instances and silently drops server

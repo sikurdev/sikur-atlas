@@ -21,8 +21,13 @@ const (
 	// context, so it carries no PID; the tuple is complete.
 	EventEstablished EventType = 3
 	// EventClose: the socket reached TCP_CLOSE. Carries lifetime byte
-	// counters; no PID.
+	// counters and the final smoothed RTT; no PID.
 	EventClose EventType = 4
+	// EventRetrans: one TCP segment was retransmitted on the socket.
+	// Only SockID is meaningful.
+	EventRetrans EventType = 5
+	// EventReset: the socket received an RST. Only SockID is meaningful.
+	EventReset EventType = 6
 )
 
 func (t EventType) String() string {
@@ -35,6 +40,10 @@ func (t EventType) String() string {
 		return "established"
 	case EventClose:
 		return "close"
+	case EventRetrans:
+		return "retransmit"
+	case EventReset:
+		return "reset"
 	default:
 		return "unknown"
 	}
@@ -52,6 +61,10 @@ type ConnEvent struct {
 	Dst       netip.AddrPort
 	BytesSent uint64 // EventClose only: bytes sent from this socket's side
 	BytesRecv uint64 // EventClose only
+	// SRTTMicros is the kernel's smoothed RTT estimate in microseconds:
+	// on EventEstablished the handshake RTT, on EventClose the mature
+	// estimate. 0 = not sampled.
+	SRTTMicros uint32
 }
 
 // ProcessInfo is the userspace identity attached to a PID.

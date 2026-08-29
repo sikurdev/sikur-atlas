@@ -46,6 +46,7 @@ func TestEventLayoutMatchesBTF(t *testing.T) {
 		"family":     offFamily,
 		"sport":      offSport,
 		"dport":      offDport,
+		"srtt_us":    offSrttUs,
 	}
 	seen := map[string]bool{}
 	for _, m := range st.Members {
@@ -75,7 +76,10 @@ func TestObjectHasProgramsAndMaps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parsing BPF object: %v", err)
 	}
-	for _, prog := range []string{"atlas_sock_set_state", "atlas_inet_csk_accept_ret"} {
+	for _, prog := range []string{
+		"atlas_sock_set_state", "atlas_inet_csk_accept_ret",
+		"atlas_tcp_retransmit", "atlas_tcp_receive_reset",
+	} {
 		if spec.Programs[prog] == nil {
 			t.Errorf("program %q missing; have %v", prog, keys(spec.Programs))
 		}
@@ -118,6 +122,7 @@ func TestDecodeEvent(t *testing.T) {
 	le.PutUint16(b[offFamily:], 2)
 	le.PutUint16(b[offSport:], 41000)
 	le.PutUint16(b[offDport:], 8080)
+	le.PutUint32(b[offSrttUs:], 1750)
 
 	base := time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC)
 	ev, err := DecodeEvent(b, func(ns uint64) time.Time {
@@ -137,6 +142,9 @@ func TestDecodeEvent(t *testing.T) {
 	}
 	if ev.BytesSent != 42 || ev.BytesRecv != 4242 || ev.SockID != 0xdeadbeef {
 		t.Fatalf("decoded %+v", ev)
+	}
+	if ev.SRTTMicros != 1750 {
+		t.Fatalf("srtt = %d, want 1750", ev.SRTTMicros)
 	}
 
 	if _, err := DecodeEvent(b[:10], func(uint64) time.Time { return base }); err == nil {
@@ -165,7 +173,7 @@ func TestDecodeEventIPv6(t *testing.T) {
 func init() {
 	// Guard against accidental struct drift making EventSize inconsistent
 	// with the field offsets above.
-	if offDport+2+2 != EventSize {
-		panic(fmt.Sprintf("event layout constants inconsistent: %d", offDport+4))
+	if offSrttUs+4+4 != EventSize {
+		panic(fmt.Sprintf("event layout constants inconsistent: %d", offSrttUs+8))
 	}
 }

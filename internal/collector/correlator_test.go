@@ -164,19 +164,77 @@ func TestInboundFromExternalPeer(t *testing.T) {
 	}
 }
 
-// A connect that never completes must not create graph state.
-func TestFailedConnectLeavesNoTrace(t *testing.T) {
-	c, store := newTestCorrelator(fakeResolver{})
+// A connect that never completes becomes a failure on the edge towards
+// its target — never a connection.
+func TestFailedConnectRecordsFailure(t *testing.T) {
+	res := fakeResolver{100: {PID: 100, Comm: "curl", Exe: "/usr/bin/curl"}}
+	c, store := newTestCorrelator(res)
 
 	c.HandleEvent(ev(model.EventOpen, 1, 100, "curl", netip.AddrPort{}, ap("10.9.9.9", 81), 0))
+	// SYN retransmit and an RST while still connecting.
+	c.HandleEvent(ev(model.EventRetrans, 1, 0, "", netip.AddrPort{}, netip.AddrPort{}, 50))
+	c.HandleEvent(ev(model.EventReset, 1, 0, "", netip.AddrPort{}, netip.AddrPort{}, 60))
 	c.HandleEvent(ev(model.EventClose, 1, 0, "", netip.AddrPort{}, ap("10.9.9.9", 81), 100))
 
-	if n := len(store.Snapshot().Nodes); n != 0 {
-		t.Fatalf("nodes = %d, want 0", n)
+	snap := store.Snapshot()
+	if len(snap.Edges) != 1 {
+		t.Fatalf("edges = %d, want 1 failure edge", len(snap.Edges))
+	}
+	e := snap.Edges[0]
+	if e.Src != "proc:/usr/bin/curl" || e.Dst != "ext:10.9.9.9" || e.DstPort != 81 {
+		t.Fatalf("unexpected edge %+v", e)
+	}
+	if e.Failures != 1 || e.Connections != 0 || e.ActiveConns != 0 {
+		t.Fatalf("failure accounting wrong: %+v", e)
+	}
+	if e.Retransmits != 1 || e.Resets != 1 {
+		t.Fatalf("pre-establishment health lost: %+v", e)
 	}
 	st := c.Stats()
 	if st.LiveSockets != 0 || st.LiveRecords != 0 {
 		t.Fatalf("state leaked: %+v", st)
+	}
+	if st.FailedConns != 1 {
+		t.Fatalf("failedConns = %d, want 1", st.FailedConns)
+	}
+}
+
+// A failed connect towards a known container address names the target
+// service instead of an external node.
+func TestFailedConnectToKnownContainer(t *testing.T) {
+	cid := "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface"
+	res := fakeResolver{
+		100: {PID: 100, Comm: "curl", Exe: "/usr/bin/curl"},
+		300: {PID: 300, Comm: "redis-server", Exe: "/usr/bin/redis-server", ContainerID: cid},
+	}
+	c, store := newTestCorrelator(res)
+
+	// A successful connection first teaches Atlas the container's address.
+	cacheAddr := ap("172.17.0.9", 6379)
+	cli := ap("172.17.0.1", 41000)
+	c.HandleEvent(ev(model.EventOpen, 1, 100, "curl", netip.AddrPort{}, cacheAddr, 0))
+	c.HandleEvent(ev(model.EventEstablished, 1, 0, "", cli, cacheAddr, 1))
+	c.HandleEvent(ev(model.EventAccept, 2, 300, "redis-server", cacheAddr, cli, 2))
+
+	// Now a refused connect to a different port on the same container.
+	c.HandleEvent(ev(model.EventOpen, 5, 100, "curl", netip.AddrPort{}, ap("172.17.0.9", 6380), 100))
+	c.HandleEvent(ev(model.EventClose, 5, 0, "", netip.AddrPort{}, ap("172.17.0.9", 6380), 150))
+
+	snap := store.Snapshot()
+	var failEdge *graph.Edge
+	for i := range snap.Edges {
+		if snap.Edges[i].DstPort == 6380 {
+			failEdge = &snap.Edges[i]
+		}
+	}
+	if failEdge == nil {
+		t.Fatalf("failure edge missing: %+v", snap.Edges)
+	}
+	if failEdge.Dst != "container:feedfacefeed" {
+		t.Fatalf("failure not attributed to container: %+v", failEdge)
+	}
+	if failEdge.Failures != 1 {
+		t.Fatalf("failures = %d", failEdge.Failures)
 	}
 }
 
@@ -298,19 +356,32 @@ func TestOrientationHintForUnaccepted(t *testing.T) {
 	}
 }
 
-func TestObserveListen(t *testing.T) {
-	res := fakeResolver{200: {PID: 200, Comm: "nginx", Exe: "/usr/sbin/nginx"}}
+func TestSyncListeners(t *testing.T) {
+	res := fakeResolver{
+		200: {PID: 200, Comm: "nginx", Exe: "/usr/sbin/nginx"},
+		201: {PID: 201, Comm: "nginx", Exe: "/usr/sbin/nginx"},
+	}
 	c, store := newTestCorrelator(res)
 
-	c.ObserveListen(200, "nginx", netip.MustParseAddr("0.0.0.0"), 8080, base)
+	// Two worker pids of the same executable merge into one node.
+	c.SyncListeners([]Listener{
+		{PID: 200, Comm: "nginx", Addr: netip.MustParseAddr("0.0.0.0"), Port: 8080},
+		{PID: 201, Comm: "nginx", Addr: netip.MustParseAddr("0.0.0.0"), Port: 8443},
+	}, base)
 
 	snap := store.Snapshot()
 	if len(snap.Nodes) != 1 {
 		t.Fatalf("nodes = %d, want 1", len(snap.Nodes))
 	}
 	n := snap.Nodes[0]
-	if n.ID != "proc:/usr/sbin/nginx" || len(n.ListenPorts) != 1 || n.ListenPorts[0] != 8080 {
+	if n.ID != "proc:/usr/sbin/nginx" || len(n.ListenPorts) != 2 {
 		t.Fatalf("unexpected node %+v", n)
+	}
+
+	// The service stops: next scan clears its ports.
+	c.SyncListeners(nil, base.Add(30*time.Second))
+	if got := store.Snapshot().Nodes[0].ListenPorts; len(got) != 0 {
+		t.Fatalf("ports survived stop: %v", got)
 	}
 }
 

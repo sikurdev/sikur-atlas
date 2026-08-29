@@ -24,6 +24,21 @@ type ProcessResolver interface {
 	Resolve(pid uint32, comm string) model.ProcessInfo
 }
 
+// Recorder receives per-edge lifecycle and health increments for
+// persistence. All methods must be cheap and non-blocking; a nil
+// Recorder disables recording.
+type Recorder interface {
+	EdgeOpened(edgeID string, at time.Time)
+	EdgeClosed(edgeID string, bytesSent, bytesRecv uint64, rttUs uint32, at time.Time)
+	// EdgeExpired releases an open connection whose close was never
+	// observed (lost event or idle-TTL expiry).
+	EdgeExpired(edgeID string, at time.Time)
+	EdgeFailure(edgeID string, at time.Time)
+	EdgeResets(edgeID string, n uint64, at time.Time)
+	EdgeRetrans(edgeID string, n uint64, at time.Time)
+	EdgeRTT(edgeID string, rttUs uint32, at time.Time)
+}
+
 type direction int
 
 const (
@@ -55,10 +70,15 @@ type sockState struct {
 	dir         direction
 	pid         uint32
 	comm        string
+	dst         netip.AddrPort // connect() target, for failure attribution
 	key         connKey
 	hasKey      bool
 	established bool
-	lastTouch   time.Time
+	// Health events observed before the socket joined a record
+	// (e.g. SYN retransmits, RST while connecting).
+	preRetrans uint64
+	preResets  uint64
+	lastTouch  time.Time
 }
 
 type connRecord struct {
@@ -80,6 +100,10 @@ type connRecord struct {
 	established   bool
 	establishedAt time.Time
 	deadline      time.Time
+	connectRTTUs  uint32
+	// Health events that arrived before the record materialized.
+	preRetrans uint64
+	preResets  uint64
 
 	materialized bool
 	edgeID       string
@@ -96,18 +120,22 @@ type pendingClose struct {
 	sockID     uint64
 	dir        direction
 	sent, recv uint64
+	rttUs      uint32
 	at         time.Time
 }
 
 // Stats are exported through /api/meta.
 type Stats struct {
-	Events       uint64 `json:"events"`
-	OpenEvents   uint64 `json:"openEvents"`
-	AcceptEvents uint64 `json:"acceptEvents"`
-	EstabEvents  uint64 `json:"establishedEvents"`
-	CloseEvents  uint64 `json:"closeEvents"`
-	LiveSockets  int    `json:"liveSockets"`
-	LiveRecords  int    `json:"liveRecords"`
+	Events        uint64 `json:"events"`
+	OpenEvents    uint64 `json:"openEvents"`
+	AcceptEvents  uint64 `json:"acceptEvents"`
+	EstabEvents   uint64 `json:"establishedEvents"`
+	CloseEvents   uint64 `json:"closeEvents"`
+	RetransEvents uint64 `json:"retransEvents"`
+	ResetEvents   uint64 `json:"resetEvents"`
+	FailedConns   uint64 `json:"failedConns"`
+	LiveSockets   int    `json:"liveSockets"`
+	LiveRecords   int    `json:"liveRecords"`
 }
 
 // Correlator is safe for concurrent use; in practice one goroutine feeds
@@ -122,6 +150,16 @@ type Correlator struct {
 	// receiver must deduplicate and never block. Set once at
 	// construction (read without the lock by ObserveListen).
 	onContainer func(containerID string)
+
+	rec Recorder // nil = no persistence
+
+	// addrIndex maps container addresses to node ids so failed connects
+	// towards a local container can name their target. Host/loopback
+	// addresses are deliberately not indexed (they don't identify one
+	// process). Guarded by addrMu: written from the event path, read by
+	// the lock-free ObserveListen path.
+	addrMu    sync.Mutex
+	addrIndex map[netip.Addr]string
 
 	socks   map[uint64]*sockState
 	records map[connKey]*connRecord
@@ -149,14 +187,20 @@ func WithIdleTTL(d time.Duration) Option {
 	return func(c *Correlator) { c.idleTTL = d }
 }
 
+// WithRecorder attaches a persistence recorder.
+func WithRecorder(r Recorder) Option {
+	return func(c *Correlator) { c.rec = r }
+}
+
 func New(store *graph.Store, resolver ProcessResolver, opts ...Option) *Correlator {
 	c := &Correlator{
-		store:    store,
-		resolver: resolver,
-		grace:    time.Second,
-		idleTTL:  time.Hour,
-		socks:    make(map[uint64]*sockState),
-		records:  make(map[connKey]*connRecord),
+		store:     store,
+		resolver:  resolver,
+		grace:     time.Second,
+		idleTTL:   time.Hour,
+		addrIndex: make(map[netip.Addr]string),
+		socks:     make(map[uint64]*sockState),
+		records:   make(map[connKey]*connRecord),
 	}
 	for _, o := range opts {
 		o(c)
@@ -183,6 +227,12 @@ func (c *Correlator) HandleEvent(ev model.ConnEvent) {
 	case model.EventClose:
 		c.stats.CloseEvents++
 		c.handleClose(ev)
+	case model.EventRetrans:
+		c.stats.RetransEvents++
+		c.handleHealthEvent(ev, healthRetrans)
+	case model.EventReset:
+		c.stats.ResetEvents++
+		c.handleHealthEvent(ev, healthReset)
 	}
 	c.stats.LiveSockets = len(c.socks)
 	c.stats.LiveRecords = len(c.records)
@@ -190,11 +240,61 @@ func (c *Correlator) HandleEvent(ev model.ConnEvent) {
 
 func (c *Correlator) handleOpen(ev model.ConnEvent) {
 	// connect() in process context. The source port may not be assigned
-	// yet, so the tuple is not trusted until EventEstablished.
+	// yet, so the tuple is not trusted until EventEstablished; the
+	// destination is, and is kept for failure attribution.
 	st := c.sock(ev.SockID, ev.Time)
 	st.dir = dirOutbound
 	st.pid = ev.PID
 	st.comm = ev.Comm
+	st.dst = ev.Dst
+	st.preRetrans = 0
+	st.preResets = 0
+}
+
+type healthKind int
+
+const (
+	healthRetrans healthKind = iota
+	healthReset
+)
+
+// handleHealthEvent attributes a retransmit/reset to the socket's edge,
+// or stashes it until the connection is identified.
+func (c *Correlator) handleHealthEvent(ev model.ConnEvent, kind healthKind) {
+	st, ok := c.socks[ev.SockID]
+	if !ok {
+		return // socket predates Atlas
+	}
+	st.lastTouch = ev.Time
+	var rec *connRecord
+	if st.hasKey {
+		rec = c.records[st.key]
+	}
+	if rec == nil || !rec.materialized {
+		switch {
+		case rec != nil && kind == healthRetrans:
+			rec.preRetrans++
+		case rec != nil:
+			rec.preResets++
+		case kind == healthRetrans:
+			st.preRetrans++
+		default:
+			st.preResets++
+		}
+		return
+	}
+	switch kind {
+	case healthRetrans:
+		c.store.EdgeRetrans(rec.edgeID, 1, ev.Time)
+		if c.rec != nil {
+			c.rec.EdgeRetrans(rec.edgeID, 1, ev.Time)
+		}
+	case healthReset:
+		c.store.EdgeResets(rec.edgeID, 1, ev.Time)
+		if c.rec != nil {
+			c.rec.EdgeResets(rec.edgeID, 1, ev.Time)
+		}
+	}
 }
 
 func (c *Correlator) handleAccept(ev model.ConnEvent) {
@@ -221,6 +321,16 @@ func (c *Correlator) handleEstablished(ev model.ConnEvent) {
 	key := canonKey(ev.Src, ev.Dst)
 	rec := c.attachSock(st, key, ev.Time)
 	st.established = true
+
+	if ev.SRTTMicros > 0 && rec.connectRTTUs == 0 {
+		rec.connectRTTUs = ev.SRTTMicros
+	}
+	// Health events stashed while the socket was connecting move to the
+	// record so they survive until materialization.
+	rec.preRetrans += st.preRetrans
+	rec.preResets += st.preResets
+	st.preRetrans = 0
+	st.preResets = 0
 
 	switch st.dir {
 	case dirOutbound:
@@ -250,7 +360,9 @@ func (c *Correlator) handleClose(ev model.ConnEvent) {
 	}
 	delete(c.socks, ev.SockID)
 	if !st.hasKey {
-		// Failed connect that never established; no record was created.
+		// Never established. An outbound socket with a known target is a
+		// failed connect — a first-class health signal.
+		c.noteFailedConnect(st, ev)
 		return
 	}
 	rec, ok := c.records[st.key]
@@ -261,7 +373,8 @@ func (c *Correlator) handleClose(ev model.ConnEvent) {
 	rec.lastTouch = ev.Time
 	pc := pendingClose{
 		sockID: ev.SockID, dir: st.dir,
-		sent: ev.BytesSent, recv: ev.BytesRecv, at: ev.Time,
+		sent: ev.BytesSent, recv: ev.BytesRecv,
+		rttUs: ev.SRTTMicros, at: ev.Time,
 	}
 
 	if !rec.established {
@@ -320,8 +433,50 @@ func (c *Correlator) applyClose(rec *connRecord, pc pendingClose) {
 		sent, recv = recv, sent
 	}
 	c.store.ConnectionClosed(rec.edgeID, sent, recv, pc.at, !rec.bytesDone)
+	c.store.EdgeRTTSample(rec.edgeID, pc.rttUs, pc.at)
+	if c.rec != nil {
+		c.rec.EdgeClosed(rec.edgeID, sent, recv, pc.rttUs, pc.at)
+	}
 	rec.bytesDone = true
 	rec.closed = true
+}
+
+// noteFailedConnect records an outbound connect that never established.
+func (c *Correlator) noteFailedConnect(st *sockState, ev model.ConnEvent) {
+	if st.dir != dirOutbound || !st.dst.IsValid() || st.dst.Addr().IsUnspecified() {
+		return
+	}
+	c.stats.FailedConns++
+	info := c.resolver.Resolve(st.pid, st.comm)
+	clientSpec := c.specForProcess(info, "")
+
+	var dstSpec graph.NodeSpec
+	if nodeID, ok := c.lookupAddr(st.dst.Addr()); ok {
+		// A known container address: attribute the failure to that
+		// service without disturbing its stored identity.
+		dstSpec = graph.NodeSpec{ID: nodeID}
+	} else {
+		dstSpec = specForExternal(st.dst.Addr())
+	}
+	edgeID := c.store.ObserveFailure(clientSpec, dstSpec, st.dst.Port(), ev.Time)
+	c.store.EdgeRetrans(edgeID, st.preRetrans, ev.Time)
+	c.store.EdgeResets(edgeID, st.preResets, ev.Time)
+	if c.rec != nil {
+		c.rec.EdgeFailure(edgeID, ev.Time)
+		if st.preRetrans > 0 {
+			c.rec.EdgeRetrans(edgeID, st.preRetrans, ev.Time)
+		}
+		if st.preResets > 0 {
+			c.rec.EdgeResets(edgeID, st.preResets, ev.Time)
+		}
+	}
+}
+
+func (c *Correlator) lookupAddr(a netip.Addr) (string, bool) {
+	c.addrMu.Lock()
+	defer c.addrMu.Unlock()
+	id, ok := c.addrIndex[a]
+	return id, ok
 }
 
 // Tick drives deadline-based materialization and stale-state sweeping.
@@ -362,18 +517,43 @@ func (c *Correlator) Tick(now time.Time) {
 func (c *Correlator) dropRecord(key connKey, rec *connRecord, at time.Time) {
 	if rec.materialized && !rec.closed {
 		c.store.ConnectionClosed(rec.edgeID, 0, 0, at, false)
+		if c.rec != nil {
+			c.rec.EdgeExpired(rec.edgeID, at)
+		}
 		rec.closed = true
 	}
 	delete(c.records, key)
 }
 
-// ObserveListen reports a listening socket discovered by the procfs
-// scanner. It deliberately takes no correlator lock: resolution may hit
-// the live /proc, and the graph store synchronizes itself.
-func (c *Correlator) ObserveListen(pid uint32, comm string, addr netip.Addr, port uint16, at time.Time) {
-	info := c.resolver.Resolve(pid, comm)
-	spec := c.specForProcess(info, addrString(addr))
-	c.store.ObserveListen(spec, port, at)
+// Listener is one listening socket found by a scan.
+type Listener struct {
+	PID  uint32
+	Comm string
+	Addr netip.Addr
+	Port uint16
+}
+
+// SyncListeners applies a complete listening-socket scan: each owning
+// node gets exactly the scanned ports, everything else loses its ports.
+// It deliberately takes no correlator lock: resolution may hit the live
+// /proc, and the graph store synchronizes itself.
+func (c *Correlator) SyncListeners(listeners []Listener, at time.Time) {
+	byNode := make(map[string]*graph.ListenerSet)
+	for _, l := range listeners {
+		info := c.resolver.Resolve(l.PID, l.Comm)
+		spec := c.specForProcess(info, addrString(l.Addr))
+		set, ok := byNode[spec.ID]
+		if !ok {
+			set = &graph.ListenerSet{Spec: spec}
+			byNode[spec.ID] = set
+		}
+		set.Ports = append(set.Ports, l.Port)
+	}
+	sets := make([]graph.ListenerSet, 0, len(byNode))
+	for _, set := range byNode {
+		sets = append(sets, *set)
+	}
+	c.store.SyncListeners(sets, at)
 }
 
 // Stats returns a copy of the current counters.
@@ -471,6 +651,24 @@ func (c *Correlator) tryMaterialize(rec *connRecord, now time.Time, force bool) 
 	rec.edgeID = c.store.ObserveConnection(clientSpec, serverSpec, rec.server.Port(), rec.establishedAt)
 	rec.materialized = true
 
+	c.store.EdgeRTTSample(rec.edgeID, rec.connectRTTUs, rec.establishedAt)
+	c.store.EdgeRetrans(rec.edgeID, rec.preRetrans, rec.establishedAt)
+	c.store.EdgeResets(rec.edgeID, rec.preResets, rec.establishedAt)
+	if c.rec != nil {
+		c.rec.EdgeOpened(rec.edgeID, rec.establishedAt)
+		if rec.connectRTTUs > 0 {
+			c.rec.EdgeRTT(rec.edgeID, rec.connectRTTUs, rec.establishedAt)
+		}
+		if rec.preRetrans > 0 {
+			c.rec.EdgeRetrans(rec.edgeID, rec.preRetrans, rec.establishedAt)
+		}
+		if rec.preResets > 0 {
+			c.rec.EdgeResets(rec.edgeID, rec.preResets, rec.establishedAt)
+		}
+	}
+	rec.preRetrans = 0
+	rec.preResets = 0
+
 	if rec.pending != nil {
 		c.applyClose(rec, *rec.pending)
 		rec.pending = nil
@@ -495,6 +693,15 @@ func (c *Correlator) specForProcess(info model.ProcessInfo, addr string) graph.N
 		// lookup that failed transiently (traffic-driven retry).
 		if c.onContainer != nil {
 			c.onContainer(info.ContainerID)
+		}
+		// Container addresses identify one network namespace, so they
+		// are usable for failed-connect attribution.
+		if addr != "" {
+			if a, err := netip.ParseAddr(addr); err == nil && !a.IsLoopback() && !a.IsUnspecified() {
+				c.addrMu.Lock()
+				c.addrIndex[a] = "container:" + short
+				c.addrMu.Unlock()
+			}
 		}
 		return graph.NodeSpec{
 			ID:          "container:" + short,

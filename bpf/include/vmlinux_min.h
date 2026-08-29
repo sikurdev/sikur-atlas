@@ -135,11 +135,28 @@ struct sock {
 	struct sock_common __sk_common;
 } __attribute__((preserve_access_index));
 
-/* include/linux/tcp.h — lifetime data-octet counters (RFC 4898), read
- * at close. Present since kernel 4.19. */
+/* include/linux/tcp.h — lifetime data-octet counters (RFC 4898, kernel
+ * >= 4.19) and the smoothed RTT estimator (µs << 3). */
 struct tcp_sock {
 	__u64 bytes_received;
 	__u64 bytes_sent;
+	__u32 srtt_us;
+} __attribute__((preserve_access_index));
+
+/* Tracepoint record shared by tcp:tcp_retransmit_skb (and siblings)
+ * (include/trace/events/tcp.h, stable since 4.15). Only skaddr is read. */
+struct trace_event_raw_tcp_event_sk_skb {
+	struct trace_entry ent;
+	const void *skbaddr;
+	const void *skaddr;
+} __attribute__((preserve_access_index));
+
+/* Tracepoint record for tcp:tcp_receive_reset (stable since 4.16).
+ * Deliberately NOT tcp_send_reset: its record grew a `reason` field in
+ * 6.10 which shifts offsets between kernel versions. */
+struct trace_event_raw_tcp_receive_reset {
+	struct trace_entry ent;
+	const void *skaddr;
 } __attribute__((preserve_access_index));
 
 #endif /* __VMLINUX_MIN_H__ */

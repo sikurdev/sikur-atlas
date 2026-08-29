@@ -36,18 +36,20 @@ type NodeSpec struct {
 
 // Node is a service in the graph.
 type Node struct {
-	ID            string    `json:"id"`
-	Kind          NodeKind  `json:"kind"`
-	Label         string    `json:"label"`
-	Exe           string    `json:"exe,omitempty"`
-	ContainerID   string    `json:"containerId,omitempty"`
-	ContainerName string    `json:"containerName,omitempty"`
-	Image         string    `json:"image,omitempty"`
-	PIDs          []uint32  `json:"pids,omitempty"`
-	ListenPorts   []uint16  `json:"listenPorts,omitempty"`
-	Addrs         []string  `json:"addrs,omitempty"`
-	FirstSeen     time.Time `json:"firstSeen"`
-	LastSeen      time.Time `json:"lastSeen"`
+	ID             string    `json:"id"`
+	Kind           NodeKind  `json:"kind"`
+	Label          string    `json:"label"`
+	Exe            string    `json:"exe,omitempty"`
+	ContainerID    string    `json:"containerId,omitempty"`
+	ContainerName  string    `json:"containerName,omitempty"`
+	Image          string    `json:"image,omitempty"`
+	ComposeProject string    `json:"composeProject,omitempty"`
+	ComposeService string    `json:"composeService,omitempty"`
+	PIDs           []uint32  `json:"pids,omitempty"`
+	ListenPorts    []uint16  `json:"listenPorts,omitempty"`
+	Addrs          []string  `json:"addrs,omitempty"`
+	FirstSeen      time.Time `json:"firstSeen"`
+	LastSeen       time.Time `json:"lastSeen"`
 }
 
 // Edge is observed communication between two nodes towards one server
@@ -62,8 +64,30 @@ type Edge struct {
 	ActiveConns int64     `json:"activeConns"`
 	BytesSent   uint64    `json:"bytesSent"`
 	BytesRecv   uint64    `json:"bytesRecv"`
+	Failures    uint64    `json:"failures,omitempty"`
+	Resets      uint64    `json:"resets,omitempty"`
+	Retransmits uint64    `json:"retransmits,omitempty"`
+	LastRTTUs   uint32    `json:"lastRttUs,omitempty"`
 	FirstSeen   time.Time `json:"firstSeen"`
 	LastSeen    time.Time `json:"lastSeen"`
+	// Window carries recent (live view) or at-that-moment (replay)
+	// health aggregates; populated by the API layer, not the store.
+	Window *EdgeWindow `json:"window,omitempty"`
+}
+
+// EdgeWindow is per-edge health aggregated over a time window.
+type EdgeWindow struct {
+	Seconds     int    `json:"seconds"`
+	Opens       uint64 `json:"opens"`
+	Closes      uint64 `json:"closes"`
+	Failures    uint64 `json:"failures"`
+	Resets      uint64 `json:"resets"`
+	Retransmits uint64 `json:"retransmits"`
+	BytesSent   uint64 `json:"bytesSent"`
+	BytesRecv   uint64 `json:"bytesRecv"`
+	RTTAvgUs    uint32 `json:"rttAvgUs"`
+	RTTMaxUs    uint32 `json:"rttMaxUs"`
+	ActiveEnd   int64  `json:"activeEnd"`
 }
 
 // Snapshot is a consistent copy of the graph.
@@ -165,15 +189,126 @@ func (s *Store) ConnectionClosed(edgeID string, bytesSent, bytesRecv uint64, at 
 	s.bumpLocked()
 }
 
-// ObserveListen records that the node identified by spec listens on port.
-func (s *Store) ObserveListen(spec NodeSpec, port uint16, at time.Time) {
+// ObserveFailure records a failed connection attempt from src towards
+// dst on dstPort. The edge is created if absent; failed attempts never
+// count as connections.
+func (s *Store) ObserveFailure(src, dst NodeSpec, dstPort uint16, at time.Time) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	n := s.upsertNodeLocked(spec, at)
-	if !slices.Contains(n.ListenPorts, port) {
-		n.ListenPorts = append(n.ListenPorts, port)
-		slices.Sort(n.ListenPorts)
+	s.upsertNodeLocked(src, at)
+	s.upsertNodeLocked(dst, at)
+
+	id := EdgeID(src.ID, dst.ID, dstPort)
+	e, ok := s.edges[id]
+	if !ok {
+		e = &Edge{
+			ID:        id,
+			Src:       src.ID,
+			Dst:       dst.ID,
+			DstPort:   dstPort,
+			Protocol:  "tcp",
+			FirstSeen: at,
+		}
+		s.edges[id] = e
+	}
+	e.Failures++
+	if at.After(e.LastSeen) {
+		e.LastSeen = at
+	}
+	s.bumpLocked()
+	return id
+}
+
+// EdgeResets counts n received RSTs on the edge.
+func (s *Store) EdgeResets(edgeID string, n uint64, at time.Time) {
+	if n == 0 {
+		return
+	}
+	s.edgeCounter(edgeID, at, func(e *Edge) { e.Resets += n })
+}
+
+// EdgeRetrans counts n retransmitted segments on the edge.
+func (s *Store) EdgeRetrans(edgeID string, n uint64, at time.Time) {
+	if n == 0 {
+		return
+	}
+	s.edgeCounter(edgeID, at, func(e *Edge) { e.Retransmits += n })
+}
+
+// EdgeRTTSample records the latest smoothed RTT observed on the edge.
+func (s *Store) EdgeRTTSample(edgeID string, rttUs uint32, at time.Time) {
+	if rttUs == 0 {
+		return
+	}
+	s.edgeCounter(edgeID, at, func(e *Edge) { e.LastRTTUs = rttUs })
+}
+
+func (s *Store) edgeCounter(edgeID string, at time.Time, apply func(*Edge)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.edges[edgeID]
+	if !ok {
+		return
+	}
+	apply(e)
+	if at.After(e.LastSeen) {
+		e.LastSeen = at
+	}
+	s.bumpLocked()
+}
+
+// SetComposeIdentity attaches docker-compose project/service labels to a
+// node.
+func (s *Store) SetComposeIdentity(nodeID, project, service string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	n, ok := s.nodes[nodeID]
+	if !ok || (n.ComposeProject == project && n.ComposeService == service) {
+		return
+	}
+	n.ComposeProject = project
+	n.ComposeService = service
+	s.bumpLocked()
+}
+
+// ListenerSet is one node's complete set of listening ports as observed
+// by a scan.
+type ListenerSet struct {
+	Spec  NodeSpec
+	Ports []uint16
+}
+
+// SyncListeners replaces listening-port state from a full scan: nodes in
+// sets get exactly those ports (and are created if unknown); nodes not
+// mentioned lose their ports. This keeps "listening" truthful — a
+// stopped service stops showing its old ports.
+func (s *Store) SyncListeners(sets []ListenerSet, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	changed := false
+	seen := make(map[string]struct{}, len(sets))
+	for _, ls := range sets {
+		seen[ls.Spec.ID] = struct{}{}
+		n := s.upsertNodeLocked(ls.Spec, at)
+		ports := slices.Clone(ls.Ports)
+		slices.Sort(ports)
+		ports = slices.Compact(ports)
+		if !slices.Equal(n.ListenPorts, ports) {
+			n.ListenPorts = ports
+			changed = true
+		}
+	}
+	for id, n := range s.nodes {
+		if _, ok := seen[id]; !ok && len(n.ListenPorts) > 0 {
+			n.ListenPorts = nil
+			changed = true
+		}
+	}
+	if changed {
 		s.bumpLocked()
 	}
 }

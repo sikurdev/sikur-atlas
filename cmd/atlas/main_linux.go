@@ -101,9 +101,14 @@ func run(listen, dockerSocket string, scanInterval time.Duration) error {
 	}()
 	go func() {
 		scan := func() {
-			for _, l := range procfs.ScanListeners() {
-				corr.ObserveListen(l.PID, l.Comm, l.Addr, l.Port, time.Now())
+			raw := procfs.ScanListeners()
+			listeners := make([]collector.Listener, len(raw))
+			for i, l := range raw {
+				listeners[i] = collector.Listener{
+					PID: l.PID, Comm: l.Comm, Addr: l.Addr, Port: l.Port,
+				}
 			}
+			corr.SyncListeners(listeners, time.Now())
 		}
 		scan()
 		t := time.NewTicker(scanInterval)

@@ -31,8 +31,10 @@ char LICENSE[] SEC("license") = "GPL";
 enum atlas_event_type {
 	ATLAS_EV_OPEN = 1,        /* outbound connect initiated (has pid) */
 	ATLAS_EV_ACCEPT = 2,      /* inbound connection accepted (has pid) */
-	ATLAS_EV_ESTABLISHED = 3, /* handshake completed (pid unknown) */
-	ATLAS_EV_CLOSE = 4,       /* socket closed (pid unknown, has bytes) */
+	ATLAS_EV_ESTABLISHED = 3, /* handshake completed (pid unknown, has rtt) */
+	ATLAS_EV_CLOSE = 4,       /* socket closed (has bytes and rtt) */
+	ATLAS_EV_RETRANS = 5,     /* one segment retransmitted (sock_id only) */
+	ATLAS_EV_RST_RECV = 6,    /* RST received on a socket (sock_id only) */
 };
 
 /* Wire format shared with the Go side (internal/ebpf/event.go). Layout is
@@ -52,6 +54,8 @@ struct conn_event {
 	__u16 sport;      /* local port, host byte order */
 	__u16 dport;      /* remote port, host byte order */
 	__u16 _pad;
+	__u32 srtt_us;    /* smoothed RTT in µs, 0 = not sampled */
+	__u32 _pad2;
 };
 
 /* Force BTF emission of the wire types: BTF only includes types reachable
@@ -90,14 +94,18 @@ static __always_inline struct conn_event *reserve_event(__u32 type)
 		note_drop();
 		return 0;
 	}
+	__builtin_memset(e, 0, sizeof(*e));
 	e->ts_ns = bpf_ktime_get_ns();
 	e->type = type;
-	e->pid = 0;
-	e->bytes_sent = 0;
-	e->bytes_recv = 0;
-	e->_pad = 0;
-	__builtin_memset(e->comm, 0, sizeof(e->comm));
 	return e;
+}
+
+/* The tcp_sock srtt estimator stores µs << 3. */
+static __always_inline __u32 read_srtt_us(const void *skaddr)
+{
+	struct tcp_sock *tp = (struct tcp_sock *)skaddr;
+
+	return BPF_CORE_READ(tp, srtt_us) >> 3;
 }
 
 static __always_inline void set_current_task(struct conn_event *e)
@@ -149,6 +157,9 @@ int atlas_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 	if (type == ATLAS_EV_OPEN) {
 		/* connect() runs in the owning process context. */
 		set_current_task(e);
+	} else if (type == ATLAS_EV_ESTABLISHED) {
+		/* Fresh from the handshake: srtt holds the connect RTT. */
+		e->srtt_us = read_srtt_us(ctx->skaddr);
 	} else if (type == ATLAS_EV_CLOSE) {
 		/* Lifetime data-octet counters (RFC 4898) from tcp_sock: unlike
 		 * bytes_acked, these never count SYN/FIN sequence space.
@@ -157,8 +168,38 @@ int atlas_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 
 		e->bytes_sent = BPF_CORE_READ(tp, bytes_sent);
 		e->bytes_recv = BPF_CORE_READ(tp, bytes_received);
+		e->srtt_us = read_srtt_us(ctx->skaddr);
 	}
 
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+/* One event per retransmitted segment. Correlated by socket identity;
+ * the userspace side attributes it to the connection's edge. */
+SEC("tracepoint/tcp/tcp_retransmit_skb")
+int atlas_tcp_retransmit(struct trace_event_raw_tcp_event_sk_skb *ctx)
+{
+	struct conn_event *e = reserve_event(ATLAS_EV_RETRANS);
+
+	if (!e)
+		return 0;
+	e->sock_id = (__u64)(unsigned long)ctx->skaddr;
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+/* RST received by a local socket (covers refused/aborted connections
+ * from this host's perspective; RSTs we send to remote peers are not
+ * counted — see docs/architecture.md). */
+SEC("tracepoint/tcp/tcp_receive_reset")
+int atlas_tcp_receive_reset(struct trace_event_raw_tcp_receive_reset *ctx)
+{
+	struct conn_event *e = reserve_event(ATLAS_EV_RST_RECV);
+
+	if (!e)
+		return 0;
+	e->sock_id = (__u64)(unsigned long)ctx->skaddr;
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }

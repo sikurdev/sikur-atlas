@@ -27,9 +27,10 @@ const (
 	offFamily    = 88
 	offSport     = 90
 	offDport     = 92
+	offSrttUs    = 96
 
 	// EventSize is sizeof(struct conn_event).
-	EventSize = 96
+	EventSize = 104
 )
 
 // DecodeEvent parses one raw ring buffer record. toTime converts the
@@ -54,6 +55,7 @@ func DecodeEvent(b []byte, toTime func(nsec uint64) time.Time) (model.ConnEvent,
 		Dst:       addrPort(daddr, le.Uint16(b[offDport:])),
 		BytesSent: le.Uint64(b[offBytesSent:]),
 		BytesRecv: le.Uint64(b[offBytesRecv:]),
+		SRTTMicros: le.Uint32(b[offSrttUs:]),
 	}
 	return ev, nil
 }

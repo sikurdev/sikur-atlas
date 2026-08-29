@@ -103,20 +103,37 @@ func TestUpsertMergesPIDsAndAddrs(t *testing.T) {
 	}
 }
 
-func TestObserveListenDeduplicates(t *testing.T) {
+func TestSyncListeners(t *testing.T) {
 	s := NewStore()
 	sp := spec("proc:/bin/nginx", NodeProcess, 10)
-	s.ObserveListen(sp, 80, t0)
-	v := s.Version()
-	s.ObserveListen(sp, 80, t1)
-	if s.Version() != v {
-		t.Fatal("duplicate listen bumped version")
-	}
-	s.ObserveListen(sp, 443, t1)
 
+	s.SyncListeners([]ListenerSet{{Spec: sp, Ports: []uint16{443, 80, 80}}}, t0)
 	n := s.Snapshot().Nodes[0]
 	if len(n.ListenPorts) != 2 || n.ListenPorts[0] != 80 || n.ListenPorts[1] != 443 {
-		t.Fatalf("listenPorts = %v", n.ListenPorts)
+		t.Fatalf("listenPorts = %v (want sorted, deduped)", n.ListenPorts)
+	}
+
+	// An identical scan must not bump the version.
+	v := s.Version()
+	s.SyncListeners([]ListenerSet{{Spec: sp, Ports: []uint16{80, 443}}}, t1)
+	if s.Version() != v {
+		t.Fatal("no-op scan bumped version")
+	}
+
+	// A scan without the node clears its ports: stopped services stop
+	// showing stale listeners.
+	s.SyncListeners(nil, t1)
+	n = s.Snapshot().Nodes[0]
+	if len(n.ListenPorts) != 0 {
+		t.Fatalf("stale ports survived: %v", n.ListenPorts)
+	}
+
+	// A scan can create a node that has produced no traffic yet.
+	other := spec("proc:/bin/postgres", NodeProcess, 20)
+	s.SyncListeners([]ListenerSet{{Spec: other, Ports: []uint16{5432}}}, t2)
+	snap := s.Snapshot()
+	if len(snap.Nodes) != 2 {
+		t.Fatalf("nodes = %d, want 2", len(snap.Nodes))
 	}
 }
 
