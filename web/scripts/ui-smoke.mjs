@@ -30,8 +30,12 @@ try {
     throw new Error(`stream status is ${JSON.stringify(status)}, want live`);
   }
 
-  // Select the busiest-looking node and check the inspector opens.
-  await page.locator('[data-testid="node"]').first().click();
+  // Let the force layout settle, then select a node and check the
+  // inspector opens. force: the layout may still drift if background
+  // traffic keeps adding nodes, and playwright's stability wait would
+  // time out on a moving SVG element.
+  await page.waitForTimeout(2500);
+  await page.locator('[data-testid="node"]').first().click({ force: true });
   await page.waitForSelector('[data-testid="inspector-node"]', {
     timeout: 5000,
   });

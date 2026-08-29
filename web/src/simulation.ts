@@ -30,6 +30,7 @@ export class GraphSim {
   private nodesById = new Map<string, SimNode>();
   private simEdges: SimEdge[] = [];
   private seq = 0;
+  private structure = "";
 
   constructor() {
     this.sim = forceSimulation<SimNode>([])
@@ -82,7 +83,21 @@ export class GraphSim {
         .distance(150)
         .strength(0.35),
     );
-    this.sim.alpha(Math.max(this.sim.alpha(), 0.5)).restart();
+
+    // Reheat the layout only when the graph's structure changed. Pure
+    // stats updates (connection counts, last-seen) must not keep the
+    // layout jiggling forever on a busy host.
+    const structure =
+      [...this.nodesById.keys()].sort().join("|") +
+      "//" +
+      this.simEdges
+        .map((e) => e.id)
+        .sort()
+        .join("|");
+    if (structure !== this.structure) {
+      this.structure = structure;
+      this.sim.alpha(Math.max(this.sim.alpha(), 0.5)).restart();
+    }
   }
 
   private anchorFor(id: string, edges: EdgeData[]): SimNode | undefined {
