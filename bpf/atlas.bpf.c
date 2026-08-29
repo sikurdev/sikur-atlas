@@ -179,30 +179,51 @@ int atlas_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx)
 }
 
 /* One event per retransmitted segment. Correlated by socket identity;
- * the userspace side attributes it to the connection's edge. */
+ * the userspace side attributes it to the connection's edge. The raw
+ * record type was renamed when the event left its event class, so the
+ * program selects whichever type the running kernel's BTF carries. */
 SEC("tracepoint/tcp/tcp_retransmit_skb")
-int atlas_tcp_retransmit(struct trace_event_raw_tcp_event_sk_skb *ctx)
+int atlas_tcp_retransmit(void *ctx)
 {
-	struct conn_event *e = reserve_event(ATLAS_EV_RETRANS);
+	struct conn_event *e;
+	const void *skaddr = 0;
 
+	if (bpf_core_type_exists(struct trace_event_raw_tcp_retransmit_skb)) {
+		struct trace_event_raw_tcp_retransmit_skb *c = ctx;
+
+		skaddr = BPF_CORE_READ(c, skaddr);
+	} else {
+		struct trace_event_raw_tcp_event_sk_skb *c = ctx;
+
+		skaddr = BPF_CORE_READ(c, skaddr);
+	}
+	if (!skaddr)
+		return 0;
+	e = reserve_event(ATLAS_EV_RETRANS);
 	if (!e)
 		return 0;
-	e->sock_id = (__u64)(unsigned long)ctx->skaddr;
+	e->sock_id = (__u64)(unsigned long)skaddr;
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
 
 /* RST received by a local socket (covers refused/aborted connections
  * from this host's perspective; RSTs we send to remote peers are not
- * counted — see docs/architecture.md). */
+ * counted — see docs/architecture.md). tcp_receive_reset has been a
+ * DEFINE_EVENT of class tcp_event_sk from 4.16 through 6.17, so its
+ * record is the class record. */
 SEC("tracepoint/tcp/tcp_receive_reset")
 int atlas_tcp_receive_reset(struct trace_event_raw_tcp_event_sk *ctx)
 {
-	struct conn_event *e = reserve_event(ATLAS_EV_RST_RECV);
+	struct conn_event *e;
+	const void *skaddr = BPF_CORE_READ(ctx, skaddr);
 
+	if (!skaddr)
+		return 0;
+	e = reserve_event(ATLAS_EV_RST_RECV);
 	if (!e)
 		return 0;
-	e->sock_id = (__u64)(unsigned long)ctx->skaddr;
+	e->sock_id = (__u64)(unsigned long)skaddr;
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }

@@ -143,9 +143,19 @@ struct tcp_sock {
 	__u32 srtt_us;
 } __attribute__((preserve_access_index));
 
-/* Tracepoint record shared by tcp:tcp_retransmit_skb (and siblings)
- * (include/trace/events/tcp.h, stable since 4.15). Only skaddr is read. */
+/* tcp:tcp_retransmit_skb's raw record: on older kernels the event is a
+ * DEFINE_EVENT of class tcp_event_sk_skb (record named after the CLASS);
+ * newer kernels (6.17 verified) made it a standalone TRACE_EVENT with a
+ * record named after the event. Only skaddr is read; the program picks
+ * the type that exists in the running kernel's BTF via
+ * bpf_core_type_exists. */
 struct trace_event_raw_tcp_event_sk_skb {
+	struct trace_entry ent;
+	const void *skbaddr;
+	const void *skaddr;
+} __attribute__((preserve_access_index));
+
+struct trace_event_raw_tcp_retransmit_skb {
 	struct trace_entry ent;
 	const void *skbaddr;
 	const void *skaddr;
