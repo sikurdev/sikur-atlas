@@ -200,6 +200,11 @@ export interface CollectorStats {
   failedConns: number;
   liveSockets: number;
   liveRecords: number;
+  seededConns: number;
+  seedClosed: number;
+  seedExpired: number;
+  seedDirHeuristic: number;
+  liveSeeds: number;
 }
 
 export interface MetaData {

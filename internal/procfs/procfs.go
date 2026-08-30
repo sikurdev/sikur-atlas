@@ -51,13 +51,6 @@ const (
 	tcpStateListen      = "0A"
 )
 
-// ParseTCPListeners parses /proc/net/tcp or /proc/net/tcp6 content and
-// returns the LISTEN sockets.
-func ParseTCPListeners(r io.Reader) []ListenSocket {
-	listeners, _ := ParseTCPTable(r)
-	return listeners
-}
-
 // ParseTCPTable parses /proc/net/tcp or /proc/net/tcp6 content and
 // returns the LISTEN and ESTABLISHED sockets. Other states (handshakes
 // in flight, teardown states like TIME_WAIT/CLOSE_WAIT) are deliberately

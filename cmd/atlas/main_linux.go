@@ -107,7 +107,11 @@ func run(listen, dockerSocket, dbPath string, scanInterval time.Duration) error 
 		return fmt.Errorf("%w\n\nAtlas needs root (or CAP_BPF+CAP_PERFMON) and a kernel >= 5.8 built with BTF (/sys/kernel/btf/vmlinux)", err)
 	}
 	defer tracer.Close()
-	log.Printf("eBPF programs attached (inet_sock_set_state, tcp_retransmit_skb, tcp_receive_reset, sched_process_exec/exit, oom mark_victim, kprobes inet_csk_accept + unix_stream_connect)")
+	if len(tracer.Missing()) == 0 {
+		log.Printf("eBPF programs attached (inet_sock_set_state, tcp_retransmit_skb, tcp_receive_reset, sched_process_exec/exit, oom mark_victim, kprobes inet_csk_accept + unix_stream_connect)")
+	} else {
+		log.Printf("eBPF tracepoints attached (inet_sock_set_state, tcp_retransmit_skb, tcp_receive_reset, sched_process_exec/exit, oom mark_victim)")
+	}
 	for _, m := range tracer.Missing() {
 		log.Printf("WARNING: this kernel cannot provide %s (kprobes unavailable?); running degraded — see /api/meta", m)
 	}

@@ -424,7 +424,7 @@ Transitions — a dependency edge's health changed:
 | kind | rule |
 | --- | --- |
 | `failures-start` | failed connects appear in a bucket after an in-window clean bucket (or on an edge first seen inside the window) |
-| `resets-spike` / `retrans-spike` | ≥ 1 reset / ≥ 3 retransmits in a bucket after a clean one (first spike per edge) |
+| `resets-spike` / `retrans-spike` | ≥ 1 reset / ≥ 3 retransmits in a bucket whose predecessor was below the floor (first spike per edge). A spike already present in the window's first bucket counts only for an edge born inside the window — on a pre-existing edge it cannot be distinguished from ongoing degradation and is not claimed as a transition |
 | `traffic-stop` | an edge active in ≥ 4 buckets falls silent (no opens or closes) for ≥ 90 s — the steadiness bar keeps CLI-style burst edges from reading as incidents |
 
 Recovery: `failures-end` (failures gone *with* traffic flowing — silence
@@ -438,9 +438,14 @@ long-broken dependency must not hijack every later incident.
 `earliest-primary-with-dependency-support`: the earliest primary
 finding anchors the incident **only when** every other primary strictly
 follows it *and* transitively depends on it (a cascade), no transition
-strictly precedes it, and every transition's target service is the
-candidate or transitively depends on it over the window's recorded
-edges. Any violation names the reason and reports unresolved: two
+strictly precedes it, and every transition is dependency-explained by
+it over the window's recorded edges: the edge's target is the candidate
+or transitively depends on it, or — for `traffic-stop` only — the
+edge's *caller* is the candidate or depends on it (when a service dies,
+its own outbound calls cease; that silence supports the candidate
+rather than contradicting it — a dead caller cannot produce failed
+connects, so failure counts stay explained by the target side only).
+Any violation names the reason and reports unresolved: two
 same-interval primaries on different services, an independent primary,
 failures that predate every primary, or impact with no dependency path.
 With no primary at all, failures alone stay unresolved ("the cause may

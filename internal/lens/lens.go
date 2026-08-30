@@ -458,6 +458,19 @@ func edgeRules(es EdgeSeries, from, to time.Time) (findings, chronic []Finding) 
 	lastResets, lastRetrans := b0.Resets, b0.Retrans
 	resetsSpiked := b0.Resets >= resetsSpikeFloor
 	retransSpiked := b0.Retrans >= retransSpikeFloor
+	bornInWindow := es.FirstSeen.Unix() >= from.Unix()
+	// A spike already present in the window's first bucket of a
+	// pre-existing edge cannot be distinguished from ongoing degradation
+	// and is not claimed as a transition; an edge born inside the window
+	// has no earlier life to blame, so its first bucket counts.
+	if resetsSpiked && bornInWindow {
+		findings = append(findings, edgeFinding(KindResetsSpike, es, b0,
+			fmt.Sprintf("connection resets from the edge's first recorded bucket: %d RSTs received", b0.Resets)))
+	}
+	if retransSpiked && bornInWindow {
+		findings = append(findings, edgeFinding(KindRetransSpike, es, b0,
+			fmt.Sprintf("retransmissions from the edge's first recorded bucket: %d segments", b0.Retrans)))
+	}
 
 	// Traffic-stop bookkeeping. Silence is usually a gap in bucket rows
 	// (an idle edge writes nothing), but an edge with standing
@@ -572,7 +585,7 @@ func edgeFinding(kind string, es EdgeSeries, b Bucket, detail string) Finding {
 		Kind:     kind,
 		Time:     time.Unix(b.Start, 0).UTC(),
 		End:      time.Unix(b.Start+b.Span, 0).UTC(),
-		Service:  edgeSubject(kind, es),
+		Service:  es.Src,
 		Edge:     es.ID,
 		EdgeSrc:  es.Src,
 		EdgeDst:  es.Dst,
@@ -580,11 +593,6 @@ func edgeFinding(kind string, es EdgeSeries, b Bucket, detail string) Finding {
 		Evidence: []Evidence{bucketEvidence(b)},
 	}
 }
-
-// edgeSubject: failure-shaped findings describe the dependency (dst)
-// being unreachable, but the observing service is the src; the src is
-// the finding's subject (the service experiencing the problem).
-func edgeSubject(_ string, es EdgeSeries) string { return es.Src }
 
 func bucketEvidence(b Bucket) Evidence {
 	return Evidence{
@@ -604,17 +612,18 @@ func presenceRules(sp ServicePresence, to time.Time) []Finding {
 	}
 	var out []Finding
 	gap := int64(goneGap.Seconds())
+	// everListening: a row BEFORE the point being judged listened — a
+	// gap only means "gone" for a service that had been a listener
+	// before the gap, and the current row must not vouch for its own
+	// past.
 	everListening := false
 	wasListening := false
-	gone := false
 
 	for i, b := range sp.Buckets {
-		if b.Listening {
-			everListening = true
-		}
 		if i > 0 {
 			prevEnd := sp.Buckets[i-1].Start + sp.Buckets[i-1].Span
-			if everListening && b.Start-prevEnd >= gap {
+			gapped := everListening && b.Start-prevEnd >= gap
+			if gapped {
 				out = append(out, presenceGone(sp, sp.Buckets[i-1], b.Start-prevEnd))
 				out = append(out, Finding{
 					Kind:    KindServiceBack,
@@ -627,9 +636,11 @@ func presenceRules(sp ServicePresence, to time.Time) []Finding {
 						Detail: fmt.Sprintf("presence row, listening=%v", b.Listening),
 					}},
 				})
-				gone = false
 			}
-			if wasListening && !b.Listening && !gone {
+			// listen-lost is a statement about two consecutive rows; the
+			// return row after a gap is a different story (told by the
+			// gone/back pair above) and must not double as one.
+			if !gapped && wasListening && !b.Listening {
 				out = append(out, Finding{
 					Kind:    KindListenLost,
 					Time:    time.Unix(b.Start, 0).UTC(),
@@ -642,6 +653,9 @@ func presenceRules(sp ServicePresence, to time.Time) []Finding {
 					}},
 				})
 			}
+		}
+		if b.Listening {
+			everListening = true
 		}
 		wasListening = b.Listening
 	}
@@ -893,18 +907,31 @@ func resolveOrigin(rep *Report, in Input, label func(string) string) {
 			return
 		}
 		target := f.EdgeDst
-		if target != origin.Service && !deps.dependsOn(target, origin.Service) {
+		dstExplained := target == origin.Service || deps.dependsOn(target, origin.Service)
+		// A traffic stop is also explained from the caller's side: when
+		// the origin (or something that depends on it) stops running, its
+		// outbound calls cease — the archetypal non-leaf origin. Failure
+		// counts are different: a dead caller cannot produce failed
+		// connects, so they stay explained by the destination only.
+		srcExplained := f.Kind == KindTrafficStop &&
+			(f.EdgeSrc == origin.Service || deps.dependsOn(f.EdgeSrc, origin.Service))
+		if !dstExplained && !srcExplained {
 			rep.Unresolved = fmt.Sprintf(
-				"%s points at %s, which has no recorded dependency path to %s; the impact is not explained by that candidate",
-				f.Kind, label(target), label(origin.Service))
+				"%s on %s involves neither a dependency of %s nor a caller affected by it; the impact is not explained by that candidate",
+				f.Kind, f.Edge, label(origin.Service))
 			return
 		}
+		explanation := fmt.Sprintf("%s → %s carries %s at/after the %s of %s, and %s is (or depends on) the origin — consistent with propagation",
+			label(f.EdgeSrc), label(f.EdgeDst), f.Kind, origin.Kind, label(origin.Service), label(target))
+		if !dstExplained {
+			explanation = fmt.Sprintf("%s → %s fell silent at/after the %s of %s, and %s is (or depends on) the origin — consistent with the caller no longer making those calls",
+				label(f.EdgeSrc), label(f.EdgeDst), origin.Kind, label(origin.Service), label(f.EdgeSrc))
+		}
 		props = append(props, Propagation{
-			CauseIdx:  c0,
-			EffectIdx: ti,
-			Inference: true,
-			Explanation: fmt.Sprintf("%s → %s carries %s at/after the %s of %s, and %s is (or depends on) the origin — consistent with propagation",
-				label(f.EdgeSrc), label(f.EdgeDst), f.Kind, origin.Kind, label(origin.Service), label(target)),
+			CauseIdx:    c0,
+			EffectIdx:   ti,
+			Inference:   true,
+			Explanation: explanation,
 		})
 	}
 	// Later same-window primaries on dependent services are cascading

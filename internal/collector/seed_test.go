@@ -346,3 +346,26 @@ func (r *captureRecorder) EdgeActive(id string, delta int64, _ time.Time) {
 	}{id, delta})
 }
 func (r *captureRecorder) NodeEvent(string, string, uint32, string, time.Time) {}
+
+func TestSeedSkipsTupleTrackedAndClosedDuringScan(t *testing.T) {
+	c, store := newTestCorrelator(seedResolver())
+
+	// A connection opens, establishes AND fully closes between BPF
+	// attach and the seed pass — all observed live. The seed scan may
+	// have read the socket table while it lived; it must not be
+	// resurrected as a standing connection.
+	c.HandleEvent(ev(model.EventOpen, 1, 100, "client", ap("10.0.0.2", 0), ap("10.0.0.3", 8000), 0))
+	c.HandleEvent(ev(model.EventEstablished, 1, 0, "", ap("10.0.0.2", 50000), ap("10.0.0.3", 8000), 10))
+	c.Tick(base.Add(2 * time.Second)) // materialize
+	c.HandleEvent(ev(model.EventClose, 1, 0, "", ap("10.0.0.2", 50000), ap("10.0.0.3", 8000), 3000))
+
+	c.SeedConnections(seedPair(), base.Add(4*time.Second))
+
+	e := edgeByID(t, store, "proc:/bin/client->ext:10.0.0.3:8000")
+	if e.ActiveConns != 0 || e.SeededConns != 0 {
+		t.Fatalf("closed tracked connection resurrected as a seed: %+v", e)
+	}
+	if got := c.Stats().SeededConns; got != 0 {
+		t.Fatalf("stats.SeededConns = %d, want 0", got)
+	}
+}

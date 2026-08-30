@@ -455,6 +455,14 @@ func (c *Correlator) handleClose(ev model.ConnEvent) {
 	if !ok {
 		return
 	}
+	if !c.seeded && rec.established {
+		// The startup seed scan may have read the socket table while
+		// this connection still lived; remembering its tuple keeps the
+		// seed pass from resurrecting a connection whose end was just
+		// witnessed (the tracked twin of the untracked case in
+		// closeSeed).
+		c.noteOrphanClose(st.key)
+	}
 	rec.sockRefs--
 	rec.lastTouch = ev.Time
 	pc := pendingClose{

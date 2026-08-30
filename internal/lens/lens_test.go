@@ -767,3 +767,126 @@ func TestRecoveryAcceptsSameSecondRestart(t *testing.T) {
 		t.Fatalf("same-second restart not matched as recovery: %+v", rep.Recovery)
 	}
 }
+
+func TestNonLeafOriginResolvesThroughItsOwnSilentCalls(t *testing.T) {
+	// orders (which itself calls inventory) dies under steady traffic:
+	// gateway→orders starts failing AND orders→inventory falls silent.
+	// The silence on orders' own outbound edge must not veto orders as
+	// the origin — its calls stopped because it stopped.
+	gwOrders := EdgeSeries{
+		ID: "svc:gateway->svc:orders:8000", Src: "svc:gateway", Dst: "svc:orders",
+		FirstSeen: t0.Add(-time.Hour),
+	}
+	specs := steady(0, 12)
+	specs = append(specs, bspec{off: 120, opens: 2, failures: 5})
+	gwOrders.Buckets = mkBuckets(specs)
+	ordersInv := EdgeSeries{
+		ID: "svc:orders->svc:inventory:8000", Src: "svc:orders", Dst: "svc:inventory",
+		FirstSeen: t0.Add(-time.Hour),
+		Buckets:   mkBuckets(steady(0, 12)), // silent from t0+120 to window end
+	}
+	rep := Investigate(Input{
+		From: t0, To: at(300),
+		Edges: []EdgeSeries{gwOrders, ordersInv},
+		Events: []LifeEvent{
+			{Service: "svc:orders", Kind: "exit", Detail: "killed by signal 15", Time: at(119)},
+		},
+	})
+	if rep.Origin == nil || rep.Origin.Service != "svc:orders" {
+		t.Fatalf("non-leaf origin vetoed by its own outbound silence: origin=%+v unresolved=%q",
+			rep.Origin, rep.Unresolved)
+	}
+	// Both effects are linked as propagation.
+	if len(rep.Propagations) < 2 {
+		t.Fatalf("expected both effects linked to the origin: %+v", rep.Propagations)
+	}
+}
+
+func TestFailuresOnOriginOutboundStillVeto(t *testing.T) {
+	// Failed connects on the candidate's own outbound edge are NOT
+	// explained by the candidate dying (a dead caller cannot produce
+	// failed connects): the evidence points at the dependency instead.
+	ordersInv := EdgeSeries{
+		ID: "svc:orders->svc:inventory:8000", Src: "svc:orders", Dst: "svc:inventory",
+		FirstSeen: t0.Add(-time.Hour),
+	}
+	specs := steady(0, 12)
+	specs = append(specs, bspec{off: 120, opens: 2, failures: 5})
+	specs = append(specs, steady(130, 17)...)
+	ordersInv.Buckets = mkBuckets(specs)
+	rep := Investigate(Input{
+		From: t0, To: at(300),
+		Edges: []EdgeSeries{ordersInv},
+		Events: []LifeEvent{
+			{Service: "svc:orders", Kind: "exit", Detail: "killed by signal 15", Time: at(119)},
+		},
+	})
+	if rep.Origin != nil {
+		t.Fatalf("failures toward inventory wrongly explained by orders dying: %+v", rep.Origin)
+	}
+}
+
+func TestPresenceGapNeedsPriorListening(t *testing.T) {
+	// A service that never listened before the gap and then appears
+	// listening did not "disappear" — it just was not a listener yet.
+	pb := []PresenceBucket{
+		{Start: t0.Unix(), Span: 10, Listening: false},
+		{Start: t0.Unix() + 10, Span: 10, Listening: false},
+	}
+	for i := int64(20); i < 30; i++ {
+		pb = append(pb, PresenceBucket{Start: t0.Unix() + i*10, Span: 10, Listening: true})
+	}
+	rep := Investigate(Input{
+		From: t0, To: at(300),
+		Presence: []ServicePresence{{ID: "svc:a", Buckets: pb}},
+	})
+	if f := findKind(rep.Findings, KindServiceGone); f != nil {
+		t.Fatalf("phantom service-gone before the service ever listened: %+v", f)
+	}
+}
+
+func TestGapReturnRowIsNotAlsoListenLost(t *testing.T) {
+	// Listening rows, a real gap, then a return row that is not
+	// listening: the gone/back pair tells that story; the return row
+	// must not additionally read as a fresh listen-lost.
+	var pb []PresenceBucket
+	for i := int64(0); i < 5; i++ {
+		pb = append(pb, PresenceBucket{Start: t0.Unix() + i*10, Span: 10, Listening: true})
+	}
+	for i := int64(20); i < 30; i++ {
+		pb = append(pb, PresenceBucket{Start: t0.Unix() + i*10, Span: 10, Listening: false})
+	}
+	rep := Investigate(Input{
+		From: t0, To: at(300),
+		Presence: []ServicePresence{{ID: "svc:a", Buckets: pb}},
+	})
+	if findKind(rep.Findings, KindServiceGone) == nil ||
+		findKind(rep.Findings, KindServiceBack) == nil {
+		t.Fatalf("gone/back pair missing: %+v", rep.Findings)
+	}
+	if f := findKind(rep.Findings, KindListenLost); f != nil {
+		t.Fatalf("gap-return row double-reported as listen-lost: %+v", f)
+	}
+}
+
+func TestBornInWindowFirstBucketSpikeIsATransition(t *testing.T) {
+	edge := EdgeSeries{
+		ID: "svc:x->svc:y:1", Src: "svc:x", Dst: "svc:y",
+		FirstSeen: at(50), // first ever seen inside the window
+	}
+	edge.Buckets = mkBuckets([]bspec{{off: 50, opens: 2, resets: 2, retrans: 4}})
+	rep := Investigate(Input{From: t0, To: at(300), Edges: []EdgeSeries{edge}})
+	if findKind(rep.Findings, KindResetsSpike) == nil {
+		t.Fatalf("born-in-window first-bucket resets not a transition: %+v", rep.Findings)
+	}
+	if findKind(rep.Findings, KindRetransSpike) == nil {
+		t.Fatalf("born-in-window first-bucket retrans not a transition: %+v", rep.Findings)
+	}
+	// A pre-existing edge's first-bucket spike stays suppressed (cannot
+	// be distinguished from ongoing degradation).
+	edge.FirstSeen = t0.Add(-time.Hour)
+	rep = Investigate(Input{From: t0, To: at(300), Edges: []EdgeSeries{edge}})
+	if f := findKind(rep.Findings, KindResetsSpike); f != nil {
+		t.Fatalf("pre-existing first-bucket spike claimed as transition: %+v", f)
+	}
+}

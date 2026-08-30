@@ -1,9 +1,15 @@
 package procfs
 
 import (
+	"io"
 	"strings"
 	"testing"
 )
+
+func listenersOf(r io.Reader) []ListenSocket {
+	listeners, _ := ParseTCPTable(r)
+	return listeners
+}
 
 func TestParseCgroupContainerID(t *testing.T) {
 	cases := []struct {
@@ -49,7 +55,7 @@ const tcpFixture = `  sl  local_address rem_address   st tx_queue rx_queue tr tm
 `
 
 func TestParseTCPListenersV4(t *testing.T) {
-	got := ParseTCPListeners(strings.NewReader(tcpFixture))
+	got := listenersOf(strings.NewReader(tcpFixture))
 	if len(got) != 2 {
 		t.Fatalf("listeners = %d, want 2 (ESTABLISHED row must be skipped)", len(got))
 	}
@@ -67,7 +73,7 @@ const tcp6Fixture = `  sl  local_address                         remote_address 
 `
 
 func TestParseTCPListenersV6(t *testing.T) {
-	got := ParseTCPListeners(strings.NewReader(tcp6Fixture))
+	got := listenersOf(strings.NewReader(tcp6Fixture))
 	if len(got) != 2 {
 		t.Fatalf("listeners = %d, want 2", len(got))
 	}

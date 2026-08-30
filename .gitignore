@@ -19,3 +19,6 @@ atlas-state.json
 
 /atlas
 /atlas.exe
+
+# UI e2e screenshot artifacts (uploaded by CI, never committed)
+atlas-ui-*.png
