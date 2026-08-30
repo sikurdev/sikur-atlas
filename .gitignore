@@ -16,3 +16,6 @@ Thumbs.db
 
 # Local state
 atlas-state.json
+
+/atlas
+/atlas.exe
