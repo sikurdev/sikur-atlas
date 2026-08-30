@@ -140,10 +140,14 @@ WHERE ts > ? AND ts <= ?`
 	}
 
 	s.mu.Lock()
-	for _, e := range s.pendingEvents {
-		if e.Time.After(from) && !e.Time.After(to) &&
-			(nodeID == "" || e.NodeID == nodeID) {
-			out = append(out, e)
+	// Staged events (in-flight flush) are not yet committed and no
+	// longer pending: merge both so a running flush opens no gap.
+	for _, buf := range [][]LifeEvent{s.flushingEvents, s.pendingEvents} {
+		for _, e := range buf {
+			if e.Time.After(from) && !e.Time.After(to) &&
+				(nodeID == "" || e.NodeID == nodeID) {
+				out = append(out, e)
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -183,14 +187,18 @@ ORDER BY bucket`, nodeID, from.Unix(), to.Unix())
 	}
 
 	s.mu.Lock()
-	for k, a := range s.metrics {
-		if k.nodeID != nodeID || k.start < from.Unix() || k.start > to.Unix() {
-			continue
+	// Staged buckets (in-flight flush) merge like pending ones so a
+	// running flush opens no gap.
+	for _, buf := range []map[metricKey]*metricAcc{s.flushingMetrics, s.metrics} {
+		for k, a := range buf {
+			if k.nodeID != nodeID || k.start < from.Unix() || k.start > to.Unix() {
+				continue
+			}
+			out = append(out, MetricPoint{
+				Start: k.start, Span: int64(s.fineSpan.Seconds()),
+				Metrics: accToMetrics(a, int(s.fineSpan.Seconds())),
+			})
 		}
-		out = append(out, MetricPoint{
-			Start: k.start, Span: int64(s.fineSpan.Seconds()),
-			Metrics: accToMetrics(a, int(s.fineSpan.Seconds())),
-		})
 	}
 	s.mu.Unlock()
 	return out, nil

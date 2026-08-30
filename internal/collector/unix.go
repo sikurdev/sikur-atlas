@@ -34,13 +34,20 @@ type pairKey struct{ client, server uint32 }
 // no single owner, so it is dropped from the listener table rather than
 // resolved last-wins — connect events to it stay unattributed instead
 // of being attributed wrongly. Pairs are unaffected (inode-exact).
-func BuildUnixPairs(socks []unixdiag.Socket, inodeToPID map[uint64]uint32) ([]UnixPair, map[string]uint32) {
+//
+// The third return value is every named listening path seen, whether or
+// not it survived into the table: the caller needs the full set to
+// detect event-buffer truncation collisions, which a dropped or
+// unattributable path still participates in.
+func BuildUnixPairs(socks []unixdiag.Socket, inodeToPID map[uint64]uint32) ([]UnixPair, map[string]uint32, []string) {
 	byInode := make(map[uint32]unixdiag.Socket, len(socks))
 	listeners := make(map[string]uint32)
 	ambiguous := make(map[string]bool)
+	pathSet := make(map[string]bool)
 	for _, s := range socks {
 		byInode[s.Inode] = s
 		if s.Listening() && s.Path != "" {
+			pathSet[s.Path] = true
 			pid, ok := inodeToPID[uint64(s.Inode)]
 			if !ok {
 				continue
@@ -54,6 +61,10 @@ func BuildUnixPairs(socks []unixdiag.Socket, inodeToPID map[uint64]uint32) ([]Un
 	}
 	for path := range ambiguous {
 		delete(listeners, path)
+	}
+	allPaths := make([]string, 0, len(pathSet))
+	for p := range pathSet {
+		allPaths = append(allPaths, p)
 	}
 
 	var pairs []UnixPair
@@ -79,7 +90,7 @@ func BuildUnixPairs(socks []unixdiag.Socket, inodeToPID map[uint64]uint32) ([]Un
 			Path:        peer.Path,
 		})
 	}
-	return pairs, listeners
+	return pairs, listeners, allPaths
 }
 
 // unixOwner is one listener-table entry: the owning node plus the full
@@ -105,27 +116,34 @@ func eventPathKey(path string) string {
 // table updates the path→service index used to attribute connect events
 // and failures. Must be called from a single goroutine.
 func (c *Correlator) SyncUnixTopology(socks []unixdiag.Socket, inodeToPID map[uint64]uint32, at time.Time) {
-	pairs, listeners := BuildUnixPairs(socks, inodeToPID)
+	pairs, listeners, allPaths := BuildUnixPairs(socks, inodeToPID)
+
+	// Distinct paths collapsing onto one event-truncated key make that
+	// key ambiguous. The witness set is EVERY named listener path —
+	// including ones dropped as multi-bound or unattributable — because
+	// a connect event to a dropped path still carries the shared
+	// truncated form and must not be credited to the surviving one.
+	truncAmbiguous := make(map[string]bool)
+	keyPath := make(map[string]string, len(allPaths))
+	for _, p := range allPaths {
+		key := eventPathKey(p)
+		if prev, seen := keyPath[key]; seen && prev != p {
+			truncAmbiguous[key] = true
+		}
+		keyPath[key] = p
+	}
 
 	// Refresh the path index (shared with the event path). The listener
 	// node is created with its full identity here: a unix-only server
-	// (no TCP at all) is otherwise never materialized properly. Two
-	// distinct long paths collapsing onto one truncated key make that
-	// key ambiguous — dropped, same policy as colliding bind paths.
+	// (no TCP at all) is otherwise never materialized properly.
 	index := make(map[string]unixOwner, len(listeners))
-	truncAmbiguous := make(map[string]bool)
 	for path, pid := range listeners {
 		info := c.resolver.Resolve(pid, "")
 		spec := c.specForProcess(info, "")
 		c.store.UpsertNode(spec, at)
-		key := eventPathKey(path)
-		if prev, seen := index[key]; seen && prev.path != path {
-			truncAmbiguous[key] = true
+		if key := eventPathKey(path); !truncAmbiguous[key] {
+			index[key] = unixOwner{nodeID: spec.ID, path: path}
 		}
-		index[key] = unixOwner{nodeID: spec.ID, path: path}
-	}
-	for key := range truncAmbiguous {
-		delete(index, key)
 	}
 	c.addrMu.Lock()
 	c.unixPathIndex = index

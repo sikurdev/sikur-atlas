@@ -3,12 +3,15 @@
 package resources
 
 import (
+	"bytes"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/sikurdev/sikur-atlas/internal/graph"
+	"github.com/sikurdev/sikur-atlas/internal/procfs"
 )
 
 // userHZ is the kernel's clock tick for /proc/<pid>/stat times; 100 on
@@ -39,9 +42,21 @@ type prevTotals struct {
 
 // Sampler collects one resource window per node per interval, bounded
 // by the topology size (only container/process nodes with known pids).
+//
+// Attribution is re-verified on every pass: a recorded pid only
+// contributes if /proc still shows it belonging to this node (same
+// container cgroup, same executable). The kernel recycles pids, and a
+// recycled pid would otherwise silently attribute a foreign process's
+// — or a foreign cgroup's — resources to the node, forever, into
+// history. Verified-stale pids are pruned from the graph node.
 type Sampler struct {
 	store *graph.Store
 	sink  MetricsSink
+
+	// procRoot/cgroupRoot exist so tests can point the sampler at a
+	// fake tree; production always uses the real mounts.
+	procRoot   string
+	cgroupRoot string
 
 	mu      sync.Mutex
 	prev    map[string]prevTotals
@@ -50,7 +65,13 @@ type Sampler struct {
 }
 
 func NewSampler(store *graph.Store, sink MetricsSink) *Sampler {
-	return &Sampler{store: store, sink: sink, prev: make(map[string]prevTotals)}
+	return &Sampler{
+		store:      store,
+		sink:       sink,
+		procRoot:   "/proc",
+		cgroupRoot: "/sys/fs/cgroup",
+		prev:       make(map[string]prevTotals),
+	}
 }
 
 // HostPressure returns the latest host PSI reading.
@@ -58,6 +79,14 @@ func (sm *Sampler) HostPressure() HostPSI {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	return sm.hostPSI
+}
+
+func (sm *Sampler) procPath(pid uint32, part string) string {
+	p := sm.procRoot + "/" + strconv.FormatUint(uint64(pid), 10)
+	if part != "" {
+		p += "/" + part
+	}
+	return p
 }
 
 // Sample takes one pass over the current topology. The first pass per
@@ -77,6 +106,7 @@ func (sm *Sampler) Sample(at time.Time) {
 		windowSecs = int(at.Sub(last).Round(time.Second) / time.Second)
 	}
 
+	sampled := make(map[string]bool, len(snap.Nodes))
 	for i := range snap.Nodes {
 		n := &snap.Nodes[i]
 		if n.Kind == graph.NodeExternal || len(n.PIDs) == 0 {
@@ -84,14 +114,19 @@ func (sm *Sampler) Sample(at time.Time) {
 		}
 		var m graph.NodeMetrics
 		var totals prevTotals
+		var stale []uint32
 		if n.Kind == graph.NodeContainer {
-			totals = sm.sampleCgroup(n, &m)
+			totals, stale = sm.sampleCgroup(n, pageSize, &m)
 		} else {
-			totals = sm.sampleProcs(n, pageSize, &m)
+			totals, stale = sm.sampleProcs(n, pageSize, &m)
+		}
+		if len(stale) > 0 {
+			sm.store.RemoveNodePIDs(n.ID, stale)
 		}
 		if !totals.valid {
 			continue
 		}
+		sampled[n.ID] = true
 
 		sm.mu.Lock()
 		prev, had := sm.prev[n.ID]
@@ -114,18 +149,27 @@ func (sm *Sampler) Sample(at time.Time) {
 	}
 
 	psi := HostPSI{}
-	if b, err := os.ReadFile("/proc/pressure/cpu"); err == nil {
+	if b, err := os.ReadFile(sm.procRoot + "/pressure/cpu"); err == nil {
 		psi.CPUSomePct = ParsePSISome(string(b))
 		psi.Available = true
 	}
-	if b, err := os.ReadFile("/proc/pressure/memory"); err == nil {
+	if b, err := os.ReadFile(sm.procRoot + "/pressure/memory"); err == nil {
 		psi.MemSomePct = ParsePSISome(string(b))
 	}
-	if b, err := os.ReadFile("/proc/pressure/io"); err == nil {
+	if b, err := os.ReadFile(sm.procRoot + "/pressure/io"); err == nil {
 		psi.IOSomePct = ParsePSISome(string(b))
 	}
 	sm.mu.Lock()
 	sm.hostPSI = psi
+	// Nodes that produced nothing this pass (vanished container, all
+	// pids pruned) lose their baseline: keeping it would leak memory
+	// per container ever seen, and a node that comes back deserves a
+	// fresh baseline anyway.
+	for id := range sm.prev {
+		if !sampled[id] {
+			delete(sm.prev, id)
+		}
+	}
 	sm.mu.Unlock()
 }
 
@@ -151,24 +195,34 @@ func sub(cur, prev uint64) uint64 {
 	return cur - prev
 }
 
-// sampleCgroup reads a container's cgroup v2 controllers via any member
-// pid's cgroup path. Gauges land directly in m; monotonic counters go
-// into the returned totals for delta computation.
-func (sm *Sampler) sampleCgroup(n *graph.Node, m *graph.NodeMetrics) prevTotals {
+// sampleCgroup reads a container's cgroup v2 controllers via a member
+// pid's cgroup path — but only a pid whose cgroup still names this
+// container counts as a member; anything else is reported stale.
+func (sm *Sampler) sampleCgroup(n *graph.Node, pageSize uint64, m *graph.NodeMetrics) (prevTotals, []uint32) {
+	var live []uint32
+	var stale []uint32
 	var cgPath string
 	for _, pid := range n.PIDs {
-		b, err := os.ReadFile("/proc/" + strconv.FormatUint(uint64(pid), 10) + "/cgroup")
+		b, err := os.ReadFile(sm.procPath(pid, "cgroup"))
 		if err != nil {
+			stale = append(stale, pid) // exited
 			continue
 		}
-		if p := ParseCgroupV2Path(string(b)); p != "" {
-			cgPath = "/sys/fs/cgroup" + p
-			break
+		if procfs.ParseCgroupContainerID(bytes.NewReader(b)) != n.ContainerID {
+			stale = append(stale, pid) // recycled for something else
+			continue
+		}
+		live = append(live, pid)
+		if cgPath == "" {
+			if p := ParseCgroupV2Path(string(b)); p != "" {
+				cgPath = sm.cgroupRoot + p
+			}
 		}
 	}
 	if cgPath == "" {
-		// cgroup v1 or vanished pids: fall back to per-pid sums.
-		return sm.sampleProcs(n, uint64(os.Getpagesize()), m)
+		// cgroup v1, or no verified member left: per-pid sums over the
+		// verified members only.
+		return sm.sumProcs(live, pageSize, m), stale
 	}
 	read := func(name string) (string, bool) {
 		b, err := os.ReadFile(cgPath + "/" + name)
@@ -206,18 +260,42 @@ func (sm *Sampler) sampleCgroup(n *graph.Node, m *graph.NodeMetrics) prevTotals 
 	if c, ok := read("memory.pressure"); ok {
 		m.PSIMemSomePct = ParsePSISome(c)
 	}
-	m.FDs, m.Threads = sumFDsThreads(n.PIDs)
-	return t
+	m.FDs, m.Threads = sm.sumFDsThreads(live)
+	return t, stale
 }
 
-// sampleProcs sums per-pid procfs numbers for host process nodes.
-func (sm *Sampler) sampleProcs(n *graph.Node, pageSize uint64, m *graph.NodeMetrics) prevTotals {
-	var t prevTotals
+// sampleProcs sums per-pid procfs numbers for host process nodes,
+// counting only pids that still run the node's executable.
+func (sm *Sampler) sampleProcs(n *graph.Node, pageSize uint64, m *graph.NodeMetrics) (prevTotals, []uint32) {
+	var live []uint32
+	var stale []uint32
 	for _, pid := range n.PIDs {
-		base := "/proc/" + strconv.FormatUint(uint64(pid), 10)
-		stat, err := os.ReadFile(base + "/stat")
+		if n.Exe != "" {
+			target, err := os.Readlink(sm.procPath(pid, "exe"))
+			if err != nil {
+				stale = append(stale, pid) // exited or kernel thread
+				continue
+			}
+			if strings.TrimSuffix(target, " (deleted)") != n.Exe {
+				stale = append(stale, pid) // recycled for another program
+				continue
+			}
+		} else if _, err := os.Stat(sm.procPath(pid, "stat")); err != nil {
+			stale = append(stale, pid)
+			continue
+		}
+		live = append(live, pid)
+	}
+	return sm.sumProcs(live, pageSize, m), stale
+}
+
+// sumProcs sums /proc numbers over an already-verified pid set.
+func (sm *Sampler) sumProcs(pids []uint32, pageSize uint64, m *graph.NodeMetrics) prevTotals {
+	var t prevTotals
+	for _, pid := range pids {
+		stat, err := os.ReadFile(sm.procPath(pid, "stat"))
 		if err != nil {
-			continue // pid gone
+			continue // pid gone since verification
 		}
 		ticks, threads, ok := ParseProcStat(string(stat))
 		if !ok {
@@ -227,28 +305,27 @@ func (sm *Sampler) sampleProcs(n *graph.Node, pageSize uint64, m *graph.NodeMetr
 		t.cpuMillis += ticks * 1000 / userHZ
 		m.Threads += threads
 		m.Procs++
-		if b, err := os.ReadFile(base + "/statm"); err == nil {
+		if b, err := os.ReadFile(sm.procPath(pid, "statm")); err == nil {
 			m.RSSBytes += ParseStatmRSS(string(b), pageSize)
 		}
-		if b, err := os.ReadFile(base + "/io"); err == nil {
+		if b, err := os.ReadFile(sm.procPath(pid, "io")); err == nil {
 			r, w := ParseProcIO(string(b))
 			t.ioRead += r
 			t.ioWrite += w
 		}
-		if ents, err := os.ReadDir(base + "/fd"); err == nil {
+		if ents, err := os.ReadDir(sm.procPath(pid, "fd")); err == nil {
 			m.FDs += len(ents)
 		}
 	}
 	return t
 }
 
-func sumFDsThreads(pids []uint32) (fds, threads int) {
+func (sm *Sampler) sumFDsThreads(pids []uint32) (fds, threads int) {
 	for _, pid := range pids {
-		base := "/proc/" + strconv.FormatUint(uint64(pid), 10)
-		if ents, err := os.ReadDir(base + "/fd"); err == nil {
+		if ents, err := os.ReadDir(sm.procPath(pid, "fd")); err == nil {
 			fds += len(ents)
 		}
-		if b, err := os.ReadFile(base + "/stat"); err == nil {
+		if b, err := os.ReadFile(sm.procPath(pid, "stat")); err == nil {
 			if _, th, ok := ParseProcStat(string(b)); ok {
 				threads += th
 			}

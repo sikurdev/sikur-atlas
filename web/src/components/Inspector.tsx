@@ -34,6 +34,16 @@ const KIND_TITLES: Record<string, string> = {
   external: "external endpoints",
 };
 
+// A TCP edge is named by its server port; an AF_UNIX edge has no port,
+// and rendering ":0" would be invented information.
+function portSuffix(e: { protocol?: string; dstPort: number }): string {
+  return e.protocol === "unix" ? " · unix" : `:${e.dstPort}`;
+}
+
+function edgeWhere(e: { protocol?: string; dstPort: number }): string {
+  return e.protocol === "unix" ? "unix socket" : `:${e.dstPort}`;
+}
+
 export function Inspector(props: Props) {
   const { graph, selection, diff, meta } = props;
 
@@ -262,7 +272,8 @@ function NodeDetails({
                   onClick={() => onSelect({ type: "edge", id: e.id })}
                 >
                   <span className={`edge-peer ${e.failures > 0 || (e.window?.failures ?? 0) > 0 ? "trouble" : ""}`}>
-                    {nodesById.get(e.dst)?.label ?? e.dst}:{e.dstPort}
+                    {nodesById.get(e.dst)?.label ?? e.dst}
+                    {portSuffix(e)}
                   </span>{" "}
                   <span className="edge-stats">{healthChips(e)}</span>
                 </button>
@@ -385,18 +396,18 @@ function useRecentChanges(
         }
         for (const e of d.addedEdges ?? []) {
           if (touches(e.src, e.dst)) {
-            out.push({ text: `+ edge → :${e.dstPort}`, tone: "add" });
+            out.push({ text: `+ edge → ${edgeWhere(e)}`, tone: "add" });
           }
         }
         for (const e of d.removedEdges ?? []) {
           if (touches(e.src, e.dst)) {
-            out.push({ text: `− edge → :${e.dstPort}`, tone: "remove" });
+            out.push({ text: `− edge → ${edgeWhere(e)}`, tone: "remove" });
           }
         }
         for (const c of d.changedEdges ?? []) {
           if (touches(c.edge.src, c.edge.dst)) {
             out.push({
-              text: `~ :${c.edge.dstPort} ${c.changes.join(", ")}`,
+              text: `~ ${edgeWhere(c.edge)} ${c.changes.join(", ")}`,
               tone: "warn",
             });
           }
@@ -540,7 +551,8 @@ function DiffPanel({
             {removedE.map((e) => (
               <li key={e.id} className="remove">
                 <button className="linkish" onClick={() => onSelect({ type: "edge", id: e.id })}>
-                  − {e.src.split(":").pop()} → {e.dst.split(":").pop()}:{e.dstPort}
+                  − {e.src.split(":").pop()} → {e.dst.split(":").pop()}
+                  {portSuffix(e)}
                 </button>
               </li>
             ))}
@@ -561,7 +573,8 @@ function DiffPanel({
             {addedE.map((e) => (
               <li key={e.id} className="add">
                 <button className="linkish" onClick={() => onSelect({ type: "edge", id: e.id })}>
-                  + {e.src.split(":").pop()} → {e.dst.split(":").pop()}:{e.dstPort}
+                  + {e.src.split(":").pop()} → {e.dst.split(":").pop()}
+                  {portSuffix(e)}
                 </button>
               </li>
             ))}
@@ -578,8 +591,8 @@ function DiffPanel({
                   className="linkish"
                   onClick={() => onSelect({ type: "edge", id: c.edge.id })}
                 >
-                  ~ {c.edge.src.split(":").pop()} → {c.edge.dst.split(":").pop()}:
-                  {c.edge.dstPort} · {c.changes.join(", ")}
+                  ~ {c.edge.src.split(":").pop()} → {c.edge.dst.split(":").pop()}
+                  {portSuffix(c.edge)} · {c.changes.join(", ")}
                   {c.changes.includes("failures") &&
                     ` (${c.aFailures} → ${c.edge.failures ?? 0})`}
                   {c.changes.includes("rtt") &&

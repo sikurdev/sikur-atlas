@@ -27,7 +27,7 @@ func TestBuildUnixPairs(t *testing.T) {
 	}
 	inodes := map[uint64]uint32{10: 200, 11: 200, 20: 100, 30: 300, 31: 300}
 
-	pairs, listeners := BuildUnixPairs(socks, inodes)
+	pairs, listeners, _ := BuildUnixPairs(socks, inodes)
 	if len(pairs) != 1 {
 		t.Fatalf("pairs = %+v, want exactly the client->server pair", pairs)
 	}
@@ -240,12 +240,21 @@ func TestBuildUnixPairsAmbiguousPath(t *testing.T) {
 		{Inode: 61, Path: "/run/app.sock", State: unixdiag.StateListen, Type: unixdiag.TypeStream},
 	}
 	inodes := map[uint64]uint32{10: 100, 50: 200, 60: 300, 61: 300}
-	_, listeners := BuildUnixPairs(socks, inodes)
+	_, listeners, allPaths := BuildUnixPairs(socks, inodes)
 	if _, ok := listeners["@X0"]; ok {
 		t.Fatalf("ambiguous path attributed last-wins: %v", listeners)
 	}
 	if listeners["/run/app.sock"] != 300 {
 		t.Fatalf("same-owner rebind dropped: %v", listeners)
+	}
+	// The dropped path must still be reported as a witness: truncation
+	// collisions involving it are otherwise invisible to the caller.
+	witness := make(map[string]bool, len(allPaths))
+	for _, p := range allPaths {
+		witness[p] = true
+	}
+	if !witness["@X0"] || !witness["/run/app.sock"] {
+		t.Fatalf("allPaths misses listener paths: %v", allPaths)
 	}
 }
 
@@ -293,6 +302,22 @@ func TestUnixConnectLongPathAttribution(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("truncation collision not treated as unknown: %+v", store.Snapshot().Edges)
+	}
+
+	// Same, when one of the colliding paths was itself dropped as
+	// multi-bound: a dropped path is still a truncation witness, so the
+	// surviving path must not absorb the dropped one's connects.
+	c2 := New(graph.NewStore(), res)
+	c2.SyncUnixTopology([]unixdiag.Socket{
+		{Inode: 10, Path: longPath, State: unixdiag.StateListen, Type: unixdiag.TypeStream},
+		{Inode: 12, Path: longPath, State: unixdiag.StateListen, Type: unixdiag.TypeStream},
+		{Inode: 11, Path: other, State: unixdiag.StateListen, Type: unixdiag.TypeStream},
+	}, map[uint64]uint32{10: 100, 12: 200, 11: 200}, base)
+	c2.addrMu.Lock()
+	_, indexed := c2.unixPathIndex[eventPathKey(other)]
+	c2.addrMu.Unlock()
+	if indexed {
+		t.Fatal("surviving path kept a truncated key its dropped twin also matches")
 	}
 }
 

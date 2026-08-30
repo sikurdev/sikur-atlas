@@ -74,11 +74,15 @@ type Store struct {
 	active      map[string]int64 // per-edge open connections
 	metaVersion uint64           // last successfully committed graph version
 
-	// v0.3: lifecycle events and resource samples awaiting flush.
+	// v0.3: lifecycle events and resource samples awaiting flush,
+	// with the same in-flight staging as edge buckets — readers merge
+	// the flushing* fields so a running transaction never opens a gap.
 	pendingEvents      []LifeEvent
 	pendingEventCounts map[string]int
 	eventsDropped      uint64
 	metrics            map[metricKey]*metricAcc
+	flushingEvents     []LifeEvent
+	flushingMetrics    map[metricKey]*metricAcc
 }
 
 func mergeAcc(dst, src *acc) {
@@ -370,9 +374,7 @@ func (s *Store) Flush(now time.Time) error {
 		activeSnapshot[k] = v
 	}
 	// Lifecycle events and completed metric buckets flush in the same
-	// transaction. Pending events remain visible to LifecycleRange via
-	// doneEvents until requeued or committed... they are drained here
-	// and requeued on failure like the counters.
+	// transaction, and stage exactly like the edge buckets do.
 	doneEvents := s.pendingEvents
 	s.pendingEvents = nil
 	s.pendingEventCounts = make(map[string]int)
@@ -383,17 +385,21 @@ func (s *Store) Flush(now time.Time) error {
 			delete(s.metrics, k)
 		}
 	}
-	// Readers merge s.flushing, so the drained interval stays visible
-	// while the transaction runs. (Between commit and the clear below a
-	// reader could briefly double-count the interval — a microsecond
-	// in-memory window, preferred over the old full-interval gap.)
+	// Readers merge the flushing* fields, so the drained data stays
+	// visible while the transaction runs. (Between commit and the clear
+	// below a reader could briefly double-count — a microsecond
+	// in-memory window, preferred over a full-interval gap.)
 	s.flushing = done
+	s.flushingEvents = doneEvents
+	s.flushingMetrics = doneMetrics
 	s.mu.Unlock()
 
 	committedVersion, err := s.flushTx(done, doneEvents, doneMetrics, activeSnapshot, now, lastBucket, span)
 
 	s.mu.Lock()
 	s.flushing = nil
+	s.flushingEvents = nil
+	s.flushingMetrics = nil
 	if err != nil {
 		for k, a := range done {
 			if exist, ok := s.buckets[k]; ok {

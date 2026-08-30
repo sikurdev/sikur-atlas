@@ -424,9 +424,11 @@ SELECT ts, kind FROM lifecycle_events WHERE ts >= ? AND ts <= ?`, fromU, toU)
 		return nil, err
 	}
 	s.mu.Lock()
-	for _, e := range s.pendingEvents {
-		if ts := e.Time.Unix(); ts >= fromU && ts <= toU {
-			life(ts, e.Kind)
+	for _, buf := range [][]LifeEvent{s.flushingEvents, s.pendingEvents} {
+		for _, e := range buf {
+			if ts := e.Time.Unix(); ts >= fromU && ts <= toU {
+				life(ts, e.Kind)
+			}
 		}
 	}
 	s.mu.Unlock()

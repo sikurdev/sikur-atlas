@@ -455,6 +455,39 @@ func (s *Store) UpsertNode(spec NodeSpec, at time.Time) {
 	}
 }
 
+// RemoveNodePIDs drops pids from a node's list. The sampler calls this
+// when /proc shows a recorded pid no longer belongs to the node —
+// exited, or recycled by the kernel for an unrelated process — because
+// a stale pid silently attributes a foreign process's resources.
+// Removing only named pids (never replacing the list) keeps this safe
+// against pids appended concurrently by the event path.
+func (s *Store) RemoveNodePIDs(nodeID string, stale []uint32) {
+	if len(stale) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.nodes[nodeID]
+	if !ok {
+		return
+	}
+	drop := make(map[uint32]bool, len(stale))
+	for _, p := range stale {
+		drop[p] = true
+	}
+	kept := n.PIDs[:0]
+	for _, p := range n.PIDs {
+		if !drop[p] {
+			kept = append(kept, p)
+		}
+	}
+	if len(kept) == len(n.PIDs) {
+		return
+	}
+	n.PIDs = kept
+	s.bumpLocked()
+}
+
 // ListenerSet is one node's complete set of listening ports as observed
 // by a scan.
 type ListenerSet struct {

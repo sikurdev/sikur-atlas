@@ -431,3 +431,54 @@ func TestReplayHidesStaleListenPorts(t *testing.T) {
 		}
 	}
 }
+
+// While a flush transaction is in flight, drained lifecycle events and
+// metric buckets are staged, not gone: a concurrent reader must still
+// see them. (Without staging, every flush opened an up-to-10s gap in
+// /api/lifecycle, /api/metrics and the timeline markers.)
+func TestStagedFlushKeepsEventsAndMetricsVisible(t *testing.T) {
+	g := seedGraph()
+	s := openTest(t, g)
+	at := t0.Add(5 * time.Second)
+	s.NodeEvent("proc:/usr/sbin/nginx", "oom", 200, "pid 200 chosen", at)
+	s.NodeSample("proc:/usr/sbin/nginx", graphNodeMetrics(64<<20), at)
+
+	// Reproduce Flush's drain exactly as a reader would see it mid-tx.
+	s.mu.Lock()
+	s.flushingEvents = s.pendingEvents
+	s.pendingEvents = nil
+	s.pendingEventCounts = make(map[string]int)
+	s.flushingMetrics = s.metrics
+	s.metrics = make(map[metricKey]*metricAcc)
+	s.mu.Unlock()
+
+	events, err := s.LifecycleRange(t0.Add(-time.Minute), at.Add(time.Minute), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Kind != "oom" {
+		t.Fatalf("staged event invisible to LifecycleRange: %+v", events)
+	}
+	points, err := s.MetricsRange("proc:/usr/sbin/nginx", t0.Add(-time.Minute), at.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || points[0].Metrics.RSSBytes != 64<<20 {
+		t.Fatalf("staged metrics invisible to MetricsRange: %+v", points)
+	}
+	tl, err := s.Timeline(t0.Add(-time.Minute), at.Add(time.Minute), 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ooms uint64
+	for _, b := range tl {
+		ooms += b.Ooms
+	}
+	if ooms != 1 {
+		t.Fatalf("staged event invisible to timeline markers: %+v", tl)
+	}
+}
+
+func graphNodeMetrics(rss uint64) graph.NodeMetrics {
+	return graph.NodeMetrics{WindowSecs: 10, CPUMillis: 100, RSSBytes: rss, Procs: 1}
+}
