@@ -123,6 +123,11 @@ try {
   ok("startup-seeded connection renders with explicit pre-existing provenance");
   await page.screenshot({ path: "atlas-ui-seeded.png" });
 
+  // Back to a node selection: the raw drill-down below acts from the
+  // node inspector.
+  await cacheNode.locator(".symbol").first().click({ force: true });
+  await page.waitForSelector('[data-testid="inspector-node"]', { timeout: 5000 });
+
   // ---- raw drill-down ----
   await page.getByTestId("btn-raw").click();
   await page.waitForFunction(
