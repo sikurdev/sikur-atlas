@@ -691,27 +691,50 @@ func TestTrafficStopNeedsSteadyActivity(t *testing.T) {
 
 func TestSystemStatusExitIsNeutral(t *testing.T) {
 	in := oomInput()
-	// The CI runner's network tooling errors out (status 1) in the same
-	// second as the OOM — recorded, but it must not contest the origin.
+	// The CI runner's network tooling errors out (status 1) and gets
+	// SIGTERM'd by its supervisor in the same second as the OOM —
+	// recorded, but it must not contest the origin.
 	in.SystemServices = map[string]bool{"svc:proc:networkctl": true}
-	in.Events = append(in.Events, LifeEvent{
-		Service: "svc:proc:networkctl", Kind: "exit",
-		Detail: "exited with status 1", Time: at(61),
-	})
+	in.Events = append(in.Events,
+		LifeEvent{
+			Service: "svc:proc:networkctl", Kind: "exit",
+			Detail: "exited with status 1", Time: at(61),
+		},
+		LifeEvent{
+			Service: "svc:proc:networkctl", Kind: "exit",
+			Detail: "killed by signal 15", Time: at(61),
+		},
+	)
 	rep := Investigate(in)
 	if rep.Origin == nil || rep.Origin.Service != "svc:users" {
-		t.Fatalf("system tool status-exit contested the origin: origin=%+v unresolved=%q",
+		t.Fatalf("system tool exits contested the origin: origin=%+v unresolved=%q",
 			rep.Origin, rep.Unresolved)
 	}
-	f := findKind(rep.Findings, KindExitStatus)
+	f := findKind(rep.Findings, KindExitSystem)
 	if f == nil || f.Service != "svc:proc:networkctl" {
-		t.Fatalf("status exit should still be recorded: %+v", rep.Findings)
+		t.Fatalf("system exit should still be recorded: %+v", rep.Findings)
 	}
 	for _, s := range rep.BlastRadius.Services {
 		if s == "svc:proc:networkctl" {
 			t.Fatalf("neutral status exit entered the blast radius: %+v", rep.BlastRadius)
 		}
 	}
+	// A system service's *crash* still anchors: the kernel said broken.
+	in3 := oomInput()
+	in3.SystemServices = map[string]bool{"svc:proc:dockerd": true}
+	in3.Events = []LifeEvent{{
+		Service: "svc:proc:dockerd", Kind: "crash",
+		Detail: "killed by SIGSEGV (signal 11)", Time: at(10),
+	}}
+	in3.Metrics = nil
+	rep3 := Investigate(in3)
+	if findKind(rep3.Findings, KindCrash) == nil {
+		t.Fatalf("system crash not recorded: %+v", rep3.Findings)
+	}
+	if rep3.Origin != nil && rep3.Origin.Service == "svc:proc:networkctl" {
+		t.Fatalf("wrong origin: %+v", rep3.Origin)
+	}
+
 	// An *app* service's status exit stays primary: only infrastructure
 	// tools get the pass.
 	in2 := oomInput()

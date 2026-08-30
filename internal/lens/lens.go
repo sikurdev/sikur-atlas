@@ -72,12 +72,13 @@ const (
 	KindTrafficStop   = "traffic-stop"
 	// Neutral lifecycle: recorded, never a primary.
 	KindExitClean = "exit-clean" // orderly exit(0): normal lifecycle
-	// KindExitStatus: a system-category process ended with a nonzero
-	// status but no signal. Infrastructure CLI tools (runc, networkctl,
-	// shims…) report errors through exit statuses as a matter of course;
-	// an infrastructure *service* dying involuntarily dies by signal,
-	// OOM or crash — which stay primary for every category.
-	KindExitStatus = "exit-status"
+	// KindExitSystem: a system-category process ended without a crash
+	// signal. Supervised infrastructure tools (runc, networkctl, shims,
+	// service managers…) exit with statuses and are SIGTERM'd/SIGKILL'd
+	// by their supervisors as a matter of course; when infrastructure
+	// *breaks*, the kernel says so — a crash signal, an OOM kill, or the
+	// service disappearing — and those stay primary for every category.
+	KindExitSystem = "exit-system"
 	// Recovery.
 	KindFailuresEnd   = "failures-end"
 	KindTrafficResume = "traffic-resume"
@@ -686,10 +687,11 @@ func lifecycleFinding(ev LifeEvent, system bool) (Finding, bool) {
 			kind, detail = KindExitClean, "process exited cleanly"
 			break
 		}
-		if system && strings.HasPrefix(ev.Detail, "exited with status") {
-			// System tools erroring out via exit status are recorded but
-			// neutral (see KindExitStatus).
-			kind, detail = KindExitStatus, fmt.Sprintf("process exited: %s", ev.Detail)
+		if system {
+			// Supervised infrastructure churn is recorded but neutral
+			// (see KindExitSystem); crashes arrive as their own event
+			// kind and stay primary.
+			kind, detail = KindExitSystem, fmt.Sprintf("process exited: %s", ev.Detail)
 			break
 		}
 		kind, detail = KindExit, fmt.Sprintf("process exited: %s", ev.Detail)
@@ -982,7 +984,7 @@ func blastRadius(findings []Finding) BlastRadius {
 	for _, f := range findings {
 		switch f.Kind {
 		case KindFailuresEnd, KindTrafficResume, KindServiceBack, KindExec,
-			KindExitClean, KindExitStatus:
+			KindExitClean, KindExitSystem:
 			continue
 		}
 		svc[f.Service] = true

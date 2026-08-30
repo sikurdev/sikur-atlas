@@ -8,7 +8,7 @@ const KIND_TITLES: Record<string, string> = {
   crash: "crash",
   exit: "exit",
   "exit-clean": "exited (clean)",
-  "exit-status": "exited (status)",
+  "exit-system": "exited (system)",
   exec: "started",
   "service-gone": "disappeared",
   "service-back": "back",

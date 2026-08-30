@@ -411,7 +411,7 @@ Terminal primaries — something stopped existing or was killed:
 | `oom` | lifecycle event: the kernel OOM killer chose a process |
 | `oom-cgroup` | `memory.events oom_kill` delta, unless the lifecycle event for the same kill (same service, same bucket) is present |
 | `crash` | lifecycle event: fatal-signal death |
-| `exit` | lifecycle event: an involuntary or erroring exit. A clean `exit(0)` is recorded as neutral `exit-clean` (every short-lived tool would otherwise read as an incident), and a *system-category* service's non-signal status exit is recorded as neutral `exit-status` (infrastructure CLIs — runc, shims, networkctl — signal errors via exit status routinely; an infrastructure service dying involuntarily dies by signal, OOM or crash, which stay primary for every category) |
+| `exit` | lifecycle event: an involuntary or erroring exit of an *app-category* service. A clean `exit(0)` is recorded as neutral `exit-clean` for every category (every short-lived tool would otherwise read as an incident), and any non-crash exit of a *system-category* service is recorded as neutral `exit-system` — supervised infrastructure (runc, shims, networkctl, service managers) exits with statuses and is TERM'd/KILL'd by its supervisors routinely, and when infrastructure actually breaks the kernel says so through the signals that stay primary everywhere: `crash`, `oom`, or the service disappearing |
 | `service-gone` | a service that had listening presence produces no presence rows for ≥ 90 s (three missed 30 s listen scans) |
 | `listen-lost` | presence continues but listening flips true → false |
 
