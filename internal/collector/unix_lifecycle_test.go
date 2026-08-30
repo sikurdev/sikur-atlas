@@ -185,6 +185,117 @@ func TestLifecycleAttribution(t *testing.T) {
 	}
 }
 
+// The exit of a command Atlas never tracked must be dropped even though
+// the exec that preceded it built (and rejected) a spec for the same
+// pid: the spec-building side effect must not seed the pid cache past
+// the existence gate. This is the cron-job scenario — exec dropped,
+// exit recorded to a ghost node — at host-shell volume.
+func TestUntrackedCommandLifecycleFullyDropped(t *testing.T) {
+	res := fakeResolver{999: {PID: 999, Comm: "backup", Exe: "/usr/bin/backup"}}
+	rec := &fakeRecorder{}
+	c := New(graph.NewStore(), res, WithRecorder(rec))
+
+	execEv := ev(model.EventExec, 0, 999, "backup", netip.AddrPort{}, netip.AddrPort{}, 100)
+	execEv.Path = "/usr/bin/backup"
+	c.HandleEvent(execEv)
+	exitEv := ev(model.EventExit, 0, 999, "backup", netip.AddrPort{}, netip.AddrPort{}, 200)
+	c.HandleEvent(exitEv)
+
+	if len(rec.nodeEvents) != 0 {
+		t.Fatalf("ghost lifecycle recorded: %v", rec.nodeEvents)
+	}
+	if got := c.Stats().LifecycleDropped; got != 2 {
+		t.Fatalf("dropped = %d, want 2 (exec and exit)", got)
+	}
+}
+
+// At the cap the pid cache must still update pids it already knows —
+// freezing stale attributions on a churn-heavy host is exactly the
+// wrong failure mode — while new pids stay excluded.
+func TestRememberPidNodeAtCap(t *testing.T) {
+	c := New(graph.NewStore(), fakeResolver{})
+	c.pidNodes[42] = "node:old"
+	for i := uint32(0); len(c.pidNodes) < maxPidNodes; i++ {
+		c.pidNodes[1_000_000+i] = "filler"
+	}
+	c.rememberPidNode(42, "node:new")
+	if got := c.pidNodes[42]; got != "node:new" {
+		t.Fatalf("known pid frozen at cap: %q", got)
+	}
+	c.rememberPidNode(77, "node:x")
+	if _, ok := c.pidNodes[77]; ok {
+		t.Fatal("new pid admitted past the cap")
+	}
+}
+
+// One path bound by different processes (different namespaces) names no
+// single owner: it must vanish from the listener table rather than
+// resolve to whichever namespace was scanned last.
+func TestBuildUnixPairsAmbiguousPath(t *testing.T) {
+	socks := []unixdiag.Socket{
+		{Inode: 10, Path: "@X0", State: unixdiag.StateListen, Type: unixdiag.TypeStream},
+		{Inode: 50, Path: "@X0", State: unixdiag.StateListen, Type: unixdiag.TypeStream},
+		// Same path, same owner (rebind leftover): stays.
+		{Inode: 60, Path: "/run/app.sock", State: unixdiag.StateListen, Type: unixdiag.TypeStream},
+		{Inode: 61, Path: "/run/app.sock", State: unixdiag.StateListen, Type: unixdiag.TypeStream},
+	}
+	inodes := map[uint64]uint32{10: 100, 50: 200, 60: 300, 61: 300}
+	_, listeners := BuildUnixPairs(socks, inodes)
+	if _, ok := listeners["@X0"]; ok {
+		t.Fatalf("ambiguous path attributed last-wins: %v", listeners)
+	}
+	if listeners["/run/app.sock"] != 300 {
+		t.Fatalf("same-owner rebind dropped: %v", listeners)
+	}
+}
+
+// Connect events carry at most 64 path bytes; listeners bound at longer
+// paths must still be matched, and the edge must carry the full path so
+// event edges and standing-pair edges share one identity.
+func TestUnixConnectLongPathAttribution(t *testing.T) {
+	longPath := "/run/" + strings.Repeat("a", 80) + ".sock"
+	res := fakeResolver{
+		100: {PID: 100, Comm: "python3", Exe: "/usr/local/bin/python3"},
+		200: {PID: 200, Comm: "reports", Exe: "/usr/local/bin/reports"},
+	}
+	store := graph.NewStore()
+	c := New(store, res)
+	c.SyncUnixTopology([]unixdiag.Socket{
+		{Inode: 10, Path: longPath, State: unixdiag.StateListen, Type: unixdiag.TypeStream},
+	}, map[uint64]uint32{10: 200}, base)
+
+	connectEv := ev(model.EventUnixConnect, 55, 100, "python3", netip.AddrPort{}, netip.AddrPort{}, 100)
+	connectEv.Path = longPath[:64] // what the BPF buffer can carry
+	c.HandleEvent(connectEv)
+
+	snap := store.Snapshot()
+	if len(snap.Edges) != 1 {
+		t.Fatalf("edges = %+v", snap.Edges)
+	}
+	e := snap.Edges[0]
+	if e.Dst != "proc:/usr/local/bin/reports" || e.Path != longPath || e.Connections != 1 {
+		t.Fatalf("long-path attribution: %+v", e)
+	}
+
+	// Two distinct long paths sharing a truncated key are ambiguous:
+	// events attribute to a placeholder, never to a guess.
+	other := longPath[:len(longPath)-5] + "-b.sock"
+	c.SyncUnixTopology([]unixdiag.Socket{
+		{Inode: 10, Path: longPath, State: unixdiag.StateListen, Type: unixdiag.TypeStream},
+		{Inode: 11, Path: other, State: unixdiag.StateListen, Type: unixdiag.TypeStream},
+	}, map[uint64]uint32{10: 200, 11: 200}, base.Add(time.Second))
+	c.HandleEvent(connectEv)
+	found := false
+	for _, e := range store.Snapshot().Edges {
+		if strings.HasPrefix(e.Dst, "unix:") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("truncation collision not treated as unknown: %+v", store.Snapshot().Edges)
+	}
+}
+
 func TestDecodeExit(t *testing.T) {
 	cases := []struct {
 		code   int32

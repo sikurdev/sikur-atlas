@@ -27,16 +27,33 @@ type pairKey struct{ client, server uint32 }
 // server (accepted stream sockets inherit the listener's name, named
 // datagram receivers are servers). Unnamed↔unnamed (socketpair) and
 // named↔named pairs carry no truthful direction and are skipped.
+//
+// The dump spans every namespace, and the same path string can be bound
+// by different processes in different namespaces (abstract names are
+// per-netns; filesystem paths are mount-ns relative). Such a path names
+// no single owner, so it is dropped from the listener table rather than
+// resolved last-wins — connect events to it stay unattributed instead
+// of being attributed wrongly. Pairs are unaffected (inode-exact).
 func BuildUnixPairs(socks []unixdiag.Socket, inodeToPID map[uint64]uint32) ([]UnixPair, map[string]uint32) {
 	byInode := make(map[uint32]unixdiag.Socket, len(socks))
 	listeners := make(map[string]uint32)
+	ambiguous := make(map[string]bool)
 	for _, s := range socks {
 		byInode[s.Inode] = s
 		if s.Listening() && s.Path != "" {
-			if pid, ok := inodeToPID[uint64(s.Inode)]; ok {
-				listeners[s.Path] = pid
+			pid, ok := inodeToPID[uint64(s.Inode)]
+			if !ok {
+				continue
 			}
+			if prev, seen := listeners[s.Path]; seen && prev != pid {
+				ambiguous[s.Path] = true
+				continue
+			}
+			listeners[s.Path] = pid
 		}
+	}
+	for path := range ambiguous {
+		delete(listeners, path)
 	}
 
 	var pairs []UnixPair
@@ -65,6 +82,24 @@ func BuildUnixPairs(socks []unixdiag.Socket, inodeToPID map[uint64]uint32) ([]Un
 	return pairs, listeners
 }
 
+// unixOwner is one listener-table entry: the owning node plus the full
+// bound path (index keys are event-truncated, see eventPathKey).
+type unixOwner struct {
+	nodeID string
+	path   string
+}
+
+// eventPathKey normalizes a bound path to what the BPF connect event
+// can carry — its buffer holds 64 bytes ("@" plus 63 name bytes for
+// abstract sockets) — so index lookups by event paths still match
+// listeners bound at longer paths.
+func eventPathKey(path string) string {
+	if len(path) > 64 {
+		return path[:64]
+	}
+	return path
+}
+
 // SyncUnixTopology applies a fresh AF_UNIX scan: new standing pairs
 // raise edges (active++), vanished pairs release them, and the listener
 // table updates the path→service index used to attribute connect events
@@ -74,13 +109,23 @@ func (c *Correlator) SyncUnixTopology(socks []unixdiag.Socket, inodeToPID map[ui
 
 	// Refresh the path index (shared with the event path). The listener
 	// node is created with its full identity here: a unix-only server
-	// (no TCP at all) is otherwise never materialized properly.
-	index := make(map[string]string, len(listeners))
+	// (no TCP at all) is otherwise never materialized properly. Two
+	// distinct long paths collapsing onto one truncated key make that
+	// key ambiguous — dropped, same policy as colliding bind paths.
+	index := make(map[string]unixOwner, len(listeners))
+	truncAmbiguous := make(map[string]bool)
 	for path, pid := range listeners {
 		info := c.resolver.Resolve(pid, "")
 		spec := c.specForProcess(info, "")
 		c.store.UpsertNode(spec, at)
-		index[path] = spec.ID
+		key := eventPathKey(path)
+		if prev, seen := index[key]; seen && prev.path != path {
+			truncAmbiguous[key] = true
+		}
+		index[key] = unixOwner{nodeID: spec.ID, path: path}
+	}
+	for key := range truncAmbiguous {
+		delete(index, key)
 	}
 	c.addrMu.Lock()
 	c.unixPathIndex = index
@@ -125,12 +170,17 @@ func (c *Correlator) handleUnixConnect(ev model.ConnEvent) {
 	clientSpec := c.specForProcess(info, "")
 
 	c.addrMu.Lock()
-	dstID, known := c.unixPathIndex[ev.Path]
+	owner, known := c.unixPathIndex[ev.Path]
 	c.addrMu.Unlock()
 
 	var dstSpec graph.NodeSpec
+	path := ev.Path
 	if known {
-		dstSpec = graph.NodeSpec{ID: dstID}
+		dstSpec = graph.NodeSpec{ID: owner.nodeID}
+		// Use the listener's full bound path so event edges and
+		// standing-pair edges share one identity even when the event
+		// buffer truncated the path.
+		path = owner.path
 	} else {
 		dstSpec = graph.NodeSpec{
 			ID:    "unix:" + ev.Path,
@@ -140,13 +190,13 @@ func (c *Correlator) handleUnixConnect(ev model.ConnEvent) {
 	}
 
 	if ev.Code == 0 {
-		edgeID := c.store.UnixConnectObserved(clientSpec, dstSpec, ev.Path, ev.Time)
+		edgeID := c.store.UnixConnectObserved(clientSpec, dstSpec, path, ev.Time)
 		if c.rec != nil {
 			c.rec.EdgeConnects(edgeID, 1, ev.Time)
 		}
 	} else {
 		c.stats.UnixFailures++
-		edgeID := c.store.ObserveUnixFailure(clientSpec, dstSpec, ev.Path, ev.Time)
+		edgeID := c.store.ObserveUnixFailure(clientSpec, dstSpec, path, ev.Time)
 		if c.rec != nil {
 			c.rec.EdgeFailure(edgeID, ev.Time)
 		}

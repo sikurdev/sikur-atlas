@@ -108,6 +108,39 @@ export function GraphCanvas({
     [layout, layered, sim],
   );
 
+  // Fit the overview to the viewport until the user takes over the
+  // camera: a topology map that opens with half its services off-screen
+  // is a map that lies about what's there.
+  const userDroveCameraRef = useRef(false);
+  useEffect(() => {
+    if (layout !== "overview" || userDroveCameraRef.current) return;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const p of layered.values()) {
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y > maxY) maxY = p.y;
+    }
+    if (minX > maxX) return; // nothing positioned yet
+    const pad = 90; // symbol + label margin
+    const k = Math.max(
+      0.2,
+      Math.min(
+        1,
+        size.w / (maxX - minX + pad * 2),
+        size.h / (maxY - minY + pad * 2),
+      ),
+    );
+    setViewport({
+      x: (-(minX + maxX) / 2) * k,
+      y: (-(minY + maxY) / 2) * k,
+      k,
+    });
+  }, [layout, layered, size]);
+
   const toWorld = useCallback(
     (clientX: number, clientY: number) => {
       const rect = svgRef.current!.getBoundingClientRect();
@@ -120,6 +153,7 @@ export function GraphCanvas({
 
   const onWheel = useCallback(
     (e: React.WheelEvent) => {
+      userDroveCameraRef.current = true;
       const factor = Math.exp(-e.deltaY * 0.0015);
       setViewport((v) => {
         const k = Math.min(4, Math.max(0.2, v.k * factor));
@@ -172,6 +206,7 @@ export function GraphCanvas({
       const dy = e.clientY - drag.startY;
       if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
       if (drag.mode === "pan") {
+        if (drag.moved) userDroveCameraRef.current = true;
         setViewport({
           ...drag.viewport,
           x: drag.viewport.x + dx,

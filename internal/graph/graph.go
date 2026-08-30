@@ -443,9 +443,14 @@ func (s *Store) SetComposeIdentity(nodeID, project, service string) {
 func (s *Store) UpsertNode(spec NodeSpec, at time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, existed := s.nodes[spec.ID]
-	s.upsertNodeLocked(spec, at)
-	if !existed {
+	prev, existed := s.nodes[spec.ID]
+	var pids, addrs int
+	var exe string
+	if existed {
+		pids, addrs, exe = len(prev.PIDs), len(prev.Addrs), prev.Exe
+	}
+	n := s.upsertNodeLocked(spec, at)
+	if !existed || len(n.PIDs) != pids || len(n.Addrs) != addrs || n.Exe != exe {
 		s.bumpLocked()
 	}
 }

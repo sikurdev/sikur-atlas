@@ -191,6 +191,28 @@ func TestContainerMetaBeforeNodeExists(t *testing.T) {
 	s.mu.Unlock()
 }
 
+// UpsertNode must notify on mutation of an existing node (new pid,
+// address, exe), not only on creation — a unix-only listener that
+// restarts with a new pid would otherwise stay stale for subscribers.
+func TestUpsertNodeBumpsOnMutation(t *testing.T) {
+	s := NewStore()
+	base := NodeSpec{ID: "proc:/bin/reports", Kind: NodeProcess, Label: "reports", PID: 100}
+	s.UpsertNode(base, t0)
+	v := s.Version()
+
+	s.UpsertNode(base, t1) // nothing new: quiet scans must not churn
+	if s.Version() != v {
+		t.Fatalf("identical upsert bumped version")
+	}
+
+	restarted := base
+	restarted.PID = 101
+	s.UpsertNode(restarted, t1)
+	if s.Version() == v {
+		t.Fatal("new pid did not notify subscribers")
+	}
+}
+
 func TestSubscribeCoalesces(t *testing.T) {
 	s := NewStore()
 	ch, cancel := s.Subscribe()

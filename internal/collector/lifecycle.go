@@ -37,9 +37,12 @@ func (c *Correlator) handleLifecycle(ev model.ConnEvent) {
 
 	switch ev.Type {
 	case model.EventExec:
-		// Resolve fresh: the pid's identity just changed.
+		// Resolve fresh: the pid's identity just changed. buildSpec, not
+		// specForProcess — the pid→node memory must only learn pids
+		// whose node actually exists, or exits of untracked commands
+		// ride the cache past this gate.
 		info := c.resolver.Resolve(ev.PID, ev.Comm)
-		spec := c.specForProcess(info, "")
+		spec := c.buildSpec(info, "")
 		if !c.store.HasNode(spec.ID) {
 			c.stats.LifecycleDropped++
 			return
@@ -92,35 +95,45 @@ func decodeExit(code int32) (string, string) {
 }
 
 // rememberPidNode caps the pid→node memory so a churn-heavy host cannot
-// grow it unboundedly. Guarded by addrMu: callers run both under and
+// grow it unboundedly. An already-known pid always updates — refusing
+// the overwrite at the cap would freeze stale attributions exactly when
+// the host is busiest. Guarded by addrMu: callers run both under and
 // outside the correlator's main lock.
 func (c *Correlator) rememberPidNode(pid uint32, nodeID string) {
 	if pid == 0 {
 		return
 	}
 	c.addrMu.Lock()
-	if len(c.pidNodes) < maxPidNodes {
+	if _, known := c.pidNodes[pid]; known || len(c.pidNodes) < maxPidNodes {
 		c.pidNodes[pid] = nodeID
 	}
 	c.addrMu.Unlock()
 }
 
 // nodeForPid finds the node a pid belongs to: last-known mapping first,
-// then a live resolve gated on the node existing.
+// then a live resolve. Every answer is gated on the node existing —
+// the cache is planted by connection paths whose nodes may never have
+// materialized, and a hit on such an entry must not invent history.
 func (c *Correlator) nodeForPid(pid uint32, comm string) string {
 	c.addrMu.Lock()
 	id, ok := c.pidNodes[pid]
 	c.addrMu.Unlock()
 	if ok {
-		return id
+		if c.store.HasNode(id) {
+			return id
+		}
+		c.addrMu.Lock()
+		delete(c.pidNodes, pid)
+		c.addrMu.Unlock()
 	}
 	info := c.resolver.Resolve(pid, comm)
 	if info.Exe == "" && info.ContainerID == "" && comm == "" && info.Comm == "" {
 		return ""
 	}
-	spec := c.specForProcess(info, "")
+	spec := c.buildSpec(info, "")
 	if !c.store.HasNode(spec.ID) {
 		return ""
 	}
+	c.rememberPidNode(pid, spec.ID)
 	return spec.ID
 }

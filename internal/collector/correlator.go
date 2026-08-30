@@ -171,19 +171,21 @@ type Correlator struct {
 	// addrIndex maps container addresses to node ids so failed connects
 	// towards a local container can name their target. Host/loopback
 	// addresses are deliberately not indexed (they don't identify one
-	// process). unixPathIndex maps bound AF_UNIX paths to their owning
-	// node. Both guarded by addrMu: written and read across the event
-	// path and the scan goroutines.
+	// process). unixPathIndex maps bound AF_UNIX paths — keyed by the
+	// event-truncated form, carrying the owner and the full path — to
+	// their owning node. Both guarded by addrMu: written and read across
+	// the event path and the scan goroutines.
 	addrMu        sync.Mutex
 	addrIndex     map[netip.Addr]string
-	unixPathIndex map[string]string
+	unixPathIndex map[string]unixOwner
 
 	// unixPairs tracks standing AF_UNIX pairs between scans; touched
 	// only by SyncUnixTopology's goroutine.
 	unixPairs map[pairKey]string
 
 	// pidNodes remembers which node a pid last belonged to, so exit/oom
-	// events can be attributed after the process is gone. Guarded by mu.
+	// events can be attributed after the process is gone. Guarded by
+	// addrMu.
 	pidNodes map[uint32]string
 
 	socks   map[uint64]*sockState
@@ -224,7 +226,7 @@ func New(store *graph.Store, resolver ProcessResolver, opts ...Option) *Correlat
 		grace:         time.Second,
 		idleTTL:       time.Hour,
 		addrIndex:     make(map[netip.Addr]string),
-		unixPathIndex: make(map[string]string),
+		unixPathIndex: make(map[string]unixOwner),
 		unixPairs:     make(map[pairKey]string),
 		pidNodes:      make(map[uint32]string),
 		socks:         make(map[uint64]*sockState),

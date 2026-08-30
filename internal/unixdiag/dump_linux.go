@@ -61,34 +61,53 @@ func DumpAll(nsPids []uint32) ([]Socket, error) {
 	return out, nil
 }
 
-// dumpInNetns runs one dump inside pid's network namespace and returns
-// to the original namespace before unlocking the OS thread. If the
-// return trip fails the thread stays locked so the runtime retires it
-// rather than reuse a thread stuck in a foreign namespace.
+// dumpInNetns runs one dump inside pid's network namespace, on its own
+// goroutine. The goroutine locks its OS thread before setns and unlocks
+// only after the namespace is verifiably restored; when the restore
+// fails, the goroutine exits still locked, so the runtime destroys the
+// thread instead of returning one stuck in a foreign namespace to the
+// scheduler pool. (Merely leaving the caller's thread locked would not
+// contain anything — the caller keeps running on it.)
 func dumpInNetns(pid uint32) ([]Socket, error) {
-	runtime.LockOSThread()
+	type result struct {
+		socks []Socket
+		err   error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		runtime.LockOSThread()
+		socks, restored, err := dumpLockedInNetns(pid)
+		if restored {
+			runtime.UnlockOSThread()
+		}
+		ch <- result{socks, err}
+	}()
+	r := <-ch
+	return r.socks, r.err
+}
+
+// dumpLockedInNetns must run on a locked OS thread. restored reports
+// whether the thread is back in its original network namespace and
+// therefore safe to reuse.
+func dumpLockedInNetns(pid uint32) (socks []Socket, restored bool, err error) {
 	self, err := os.Open("/proc/thread-self/ns/net")
 	if err != nil {
-		runtime.UnlockOSThread()
-		return nil, fmt.Errorf("open own netns: %w", err)
+		return nil, true, fmt.Errorf("open own netns: %w", err)
 	}
 	defer self.Close()
 	target, err := os.Open(fmt.Sprintf("/proc/%d/ns/net", pid))
 	if err != nil {
-		runtime.UnlockOSThread()
-		return nil, fmt.Errorf("open netns of pid %d: %w", pid, err)
+		return nil, true, fmt.Errorf("open netns of pid %d: %w", pid, err)
 	}
 	defer target.Close()
 	if err := unix.Setns(int(target.Fd()), unix.CLONE_NEWNET); err != nil {
-		runtime.UnlockOSThread()
-		return nil, fmt.Errorf("setns to pid %d: %w", pid, err)
+		return nil, true, fmt.Errorf("setns to pid %d: %w", pid, err)
 	}
 	socks, dumpErr := dumpCurrentNetns()
 	if err := unix.Setns(int(self.Fd()), unix.CLONE_NEWNET); err != nil {
-		return nil, fmt.Errorf("restore netns: %w", err)
+		return nil, false, fmt.Errorf("restore netns: %w", err)
 	}
-	runtime.UnlockOSThread()
-	return socks, dumpErr
+	return socks, true, dumpErr
 }
 
 func dumpCurrentNetns() ([]Socket, error) {
