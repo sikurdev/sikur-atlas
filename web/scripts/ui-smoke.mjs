@@ -225,11 +225,9 @@ try {
     await page.waitForTimeout(1500);
     await page.screenshot({ path: "atlas-ui-lens.png" });
 
-    // A finding's timestamp jumps straight into Replay at that moment.
-    await page
-      .locator('[data-testid="lens-finding"] .lens-time')
-      .first()
-      .click();
+    // The origin's "View moment" jumps straight into Replay at the
+    // recorded moment (the same navigation every finding row offers).
+    await page.getByTestId("btn-lens-origin-moment").click();
     await page.waitForFunction(
       () => {
         const el = document.querySelector('[data-testid="time-mode"]');
@@ -238,7 +236,7 @@ try {
       undefined,
       { timeout: 10000 },
     );
-    ok("lens finding jumps into Replay at the recorded moment");
+    ok("lens jumps into Replay at the origin's recorded moment");
 
     // Focus the suspected origin from the Lens.
     await page.getByTestId("btn-lens-focus-origin").click();

@@ -24,6 +24,14 @@ const failures = [];
 const found = [];
 const svc = (name) => `svc:compose:atlas-demo/${name}`;
 
+// Let the window's final buckets close and flush before investigating:
+// a bucket still being written would make the determinism double-query
+// below race live traffic rather than test the engine.
+const settle = to - (Math.floor(Date.now() / 1000) - 15);
+if (settle > 0) {
+  await new Promise((r) => setTimeout(r, settle * 1000));
+}
+
 const report = await getJSON(`${base}/api/lens?from=${from}&to=${to}`);
 const findings = report.findings ?? [];
 const chronic = report.chronic ?? [];
@@ -150,8 +158,12 @@ if (mode === "stop") {
   if (report.origin && !props.some((p) => p.inference === true)) {
     failures.push(`no propagation inference recorded: ${JSON.stringify(props)}`);
   }
-  // Nothing recovered: inventory stays down in this window.
-  const recovered = (report.recovery ?? []).filter((r) => r.recoveredAt != null);
+  // Nothing recovered among the demo services: inventory stays down in
+  // this window (background host edges may come and go; they are not
+  // this incident).
+  const recovered = (report.recovery ?? []).filter(
+    (r) => r.recoveredAt != null && r.subject.includes("atlas-demo"),
+  );
   if (recovered.length > 0) {
     failures.push(`unexpected recovery in stop window: ${JSON.stringify(recovered)}`);
   }
