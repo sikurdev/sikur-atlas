@@ -10,7 +10,7 @@ import (
 	"github.com/sikurdev/sikur-atlas/internal/tui"
 )
 
-var version = "0.3.0-dev" // overridden via -ldflags at release build
+var version = "0.3.0" // overridden via -ldflags at release build
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "top" {
