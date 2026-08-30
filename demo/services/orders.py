@@ -26,15 +26,18 @@ def tally_report():
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        # The report tally is independent of inventory: the IPC edge
+        # must keep carrying traffic even while a TCP dependency is
+        # down (that outage is part of the demo's story).
+        try:
+            report = tally_report()
+        except OSError:
+            report = "unavailable"
         try:
             with urllib.request.urlopen(INVENTORY_URL, timeout=3) as r:
                 stock = json.load(r)
             rediswire.command(CACHE_HOST, "INCR", "orders:served")
             served = rediswire.command(CACHE_HOST, "GET", "orders:served")
-            try:
-                report = tally_report()
-            except OSError:
-                report = "unavailable"
             body = json.dumps({
                 "service": "orders",
                 "stock": stock,
@@ -43,7 +46,11 @@ class Handler(BaseHTTPRequestHandler):
             }).encode()
             status = 200
         except OSError as exc:
-            body = json.dumps({"service": "orders", "error": str(exc)}).encode()
+            body = json.dumps({
+                "service": "orders",
+                "error": str(exc),
+                "report": report,
+            }).encode()
             status = 502
         self.send_response(status)
         self.send_header("Content-Type", "application/json")

@@ -19,8 +19,14 @@ const ok = (what) => {
 };
 
 const browser = await chromium.launch();
+const consoleTail = [];
 try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  page.on("console", (msg) => {
+    consoleTail.push(`[${msg.type()}] ${msg.text()}`);
+    if (consoleTail.length > 30) consoleTail.shift();
+  });
+  page.on("pageerror", (err) => consoleTail.push(`[pageerror] ${err.message}`));
 
   // ---- live view (Services / Overview by default) ----
   await page.goto(base, { waitUntil: "domcontentloaded" });
@@ -180,6 +186,23 @@ try {
   console.log(`UI E2E OK: ${checks.length} interactions verified`);
 } catch (err) {
   console.error("UI E2E FAILED:", err.message ?? err);
+  if (consoleTail.length > 0) {
+    console.error("browser console tail:");
+    for (const line of consoleTail) console.error("  " + line);
+  }
+  try {
+    // What the agent was actually serving at failure time.
+    const app = await (await fetch(`${base}/api/appview`)).json();
+    console.error(
+      "appview at failure:",
+      JSON.stringify({
+        nodes: app.nodes.map((n) => n.label),
+        edges: app.edges.map((e) => `${e.src}->${e.dst}${e.protocol === "unix" ? " [unix]" : ""}`),
+      }),
+    );
+  } catch {
+    // best effort
+  }
   try {
     const page = (await browser.contexts())[0]?.pages()[0];
     if (page) await page.screenshot({ path: "atlas-ui-failure.png" });
