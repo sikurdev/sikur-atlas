@@ -106,6 +106,12 @@ curl "localhost:7171/api/lens?from=$(date -d '-10 min' +%s)&to=$(date +%s)"
 #   button in the UI for the same report with jump-to-Replay per finding.
 ```
 
+![Incident Lens: a SIGKILLed service named as the likely origin, with
+the inference badge, the rule that produced it, and the recorded
+evidence expanded — captured live on a minimal kernel running in
+degraded mode, seeded holdconn → cache edge on the
+map](docs/atlas-lens.png)
+
 `make demo-down` removes the workload. `make e2e` runs this whole story
 non-interactively — connections established *before* the agent starts
 (container and host) that must appear seeded without replacement
