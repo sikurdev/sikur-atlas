@@ -151,6 +151,13 @@ type Stats struct {
 	LifecycleDropped uint64 `json:"lifecycleDropped"`
 	LiveSockets      int    `json:"liveSockets"`
 	LiveRecords      int    `json:"liveRecords"`
+	// Startup-seed accounting: connections discovered standing by the
+	// initial socket-table scan, and how they were retired.
+	SeededConns      uint64 `json:"seededConns"`
+	SeedClosed       uint64 `json:"seedClosed"`
+	SeedExpired      uint64 `json:"seedExpired"`
+	SeedDirHeuristic uint64 `json:"seedDirHeuristic"`
+	LiveSeeds        int    `json:"liveSeeds"`
 }
 
 // Correlator is safe for concurrent use; in practice one goroutine feeds
@@ -190,7 +197,15 @@ type Correlator struct {
 
 	socks   map[uint64]*sockState
 	records map[connKey]*connRecord
-	stats   Stats
+	// seeds tracks connections that predate the agent, discovered by the
+	// startup socket scan and keyed like records. orphanCloses buffers
+	// unknown-socket closes until the first seed pass so a connection
+	// that died mid-scan is not resurrected; seeded flips once, after
+	// which the buffer is never used again.
+	seeds        map[connKey]*seedRecord
+	orphanCloses map[connKey]struct{}
+	seeded       bool
+	stats        Stats
 }
 
 // Option configures a Correlator.
@@ -231,6 +246,7 @@ func New(store *graph.Store, resolver ProcessResolver, opts ...Option) *Correlat
 		pidNodes:      make(map[uint32]string),
 		socks:         make(map[uint64]*sockState),
 		records:       make(map[connKey]*connRecord),
+		seeds:         make(map[connKey]*seedRecord),
 	}
 	for _, o := range opts {
 		o(c)
@@ -423,7 +439,9 @@ func (c *Correlator) handleEstablished(ev model.ConnEvent) {
 func (c *Correlator) handleClose(ev model.ConnEvent) {
 	st, ok := c.socks[ev.SockID]
 	if !ok {
-		// Socket predates Atlas (or is a listen socket): nothing tracked.
+		// No tracked socket: either a listen socket, or a connection
+		// that predates Atlas — the startup seed may know its tuple.
+		c.closeSeed(ev)
 		return
 	}
 	delete(c.socks, ev.SockID)
@@ -663,6 +681,11 @@ func (c *Correlator) attachSock(st *sockState, key connKey, at time.Time) *connR
 	}
 	rec, ok := c.records[key]
 	if !ok {
+		// A live connection claiming a seeded tuple proves the seeded
+		// socket is gone — two established connections cannot share one
+		// 4-tuple — and its close event was lost. Release the seed before
+		// the new record takes over, so the active count never doubles.
+		c.expireSeedLocked(key, at)
 		rec = &connRecord{key: key, lastTouch: at}
 		c.records[key] = rec
 	}

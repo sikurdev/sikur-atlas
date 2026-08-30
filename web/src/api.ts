@@ -60,6 +60,7 @@ export interface EdgeData {
   path?: string;
   connections: number;
   activeConns: number;
+  seededConns?: number;
   bytesSent: number;
   bytesRecv: number;
   failures?: number;
@@ -104,6 +105,7 @@ export interface AppEdge {
   path?: string;
   connections: number;
   activeConns: number;
+  seededConns?: number;
   bytesSent: number;
   bytesRecv: number;
   failures?: number;
@@ -298,4 +300,75 @@ export function fetchTimeline(from: number, to: number, step: number): Promise<T
 
 export function fetchLifecycle(from: number, to: number): Promise<{ events: LifeEvent[] | null }> {
   return getJSON(`/api/lifecycle?from=${from}&to=${to}`);
+}
+
+// ---- Incident Lens (GET /api/lens) ----
+
+export interface LensEvidence {
+  source: string; // edge-bucket | lifecycle-event | metric-bucket | presence
+  time: number; // unix seconds
+  spanSecs?: number;
+  detail: string;
+}
+
+export interface LensFinding {
+  kind: string;
+  time: string; // RFC3339
+  end: string;
+  service: string;
+  label: string;
+  edge?: string;
+  edgeSrc?: string;
+  edgeDst?: string;
+  detail: string;
+  evidence: LensEvidence[];
+}
+
+export interface LensOrigin {
+  service: string;
+  label: string;
+  time: string;
+  findingIndex: number;
+  rule: string;
+  inference: boolean;
+  explanation: string;
+}
+
+export interface LensPropagation {
+  causeIndex: number;
+  effectIndex: number;
+  inference: boolean;
+  explanation: string;
+}
+
+export interface LensRecovery {
+  subject: string;
+  degradedIndex: number;
+  recoveredAt: string | null;
+  recoveryIndex: number;
+  detail: string;
+}
+
+export interface LensReport {
+  from: string;
+  to: string;
+  service?: string;
+  ruleSet: string;
+  findings: LensFinding[] | null;
+  chronic: LensFinding[] | null;
+  origin: LensOrigin | null;
+  unresolved?: string;
+  propagations: LensPropagation[] | null;
+  blastRadius: { services: string[] | null; edges: string[] | null };
+  recovery: LensRecovery[] | null;
+  labels: Record<string, string>;
+}
+
+export function fetchLens(
+  from: number,
+  to: number,
+  service?: string,
+): Promise<LensReport> {
+  const svc = service ? `&service=${encodeURIComponent(service)}` : "";
+  return getJSON(`/api/lens?from=${from}&to=${to}${svc}`);
 }

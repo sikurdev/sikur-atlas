@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 // Drives a real browser against a running agent and verifies the whole
 // investigation surface: live view, filtering, inspector, focus, raw
-// drill-down, Replay (?at=), Compare (?a=&b=) — with screenshots as
+// drill-down, startup-seeded connections, Replay (?at=), Compare
+// (?a=&b=), and the Incident Lens (?lf=&lt=) — with screenshots as
 // evidence.
 //
-// Usage: node web/scripts/ui-smoke.mjs [baseURL] [t1] [t2]
+// Usage: node web/scripts/ui-smoke.mjs [baseURL] [t1] [t2] [lensFrom]
 import { chromium } from "playwright";
 
 const base = process.argv[2] ?? "http://127.0.0.1:7171";
 const t1 = Number(process.argv[3]) || null;
 const t2 = Number(process.argv[4]) || null;
+const lensFrom = Number(process.argv[5]) || null;
 const MIN_NODES = Number(process.env.UI_SMOKE_MIN_NODES ?? "5");
 
 const checks = [];
@@ -101,6 +103,26 @@ try {
   await page.screenshot({ path: "atlas-ui-focus.png" });
   await page.getByTestId("btn-focus").click(); // unfocus
 
+  // ---- startup-seeded topology: the holdconn connection predates the
+  // agent (established before the last agent start), so the edge must
+  // carry explicit seeded provenance in the inspector.
+  await page
+    .locator('[data-testid="node"]', { hasText: "holdconn" })
+    .first()
+    .locator(".symbol")
+    .first()
+    .click({ force: true });
+  await page.waitForSelector('[data-testid="deps-out"]', { timeout: 5000 });
+  await page.locator('[data-testid="deps-out"] button').first().click();
+  await page.waitForSelector('[data-testid="inspector-edge"]', { timeout: 5000 });
+  await page.waitForSelector('[data-testid="edge-seeded"]', { timeout: 5000 });
+  const seeded = await page.getByTestId("edge-seeded").innerText();
+  if (!seeded.includes("pre-existing")) {
+    throw new Error(`seeded provenance missing: ${seeded}`);
+  }
+  ok("startup-seeded connection renders with explicit pre-existing provenance");
+  await page.screenshot({ path: "atlas-ui-seeded.png" });
+
   // ---- raw drill-down ----
   await page.getByTestId("btn-raw").click();
   await page.waitForFunction(
@@ -181,6 +203,60 @@ try {
       { timeout: 10000 },
     );
     ok("exit compare returns to live");
+  }
+
+  if (lensFrom != null && t2 != null) {
+    // ---- Incident Lens over the recorded stop incident ----
+    await page.goto(`${base}/?lf=${lensFrom}&lt=${t2}`, {
+      waitUntil: "domcontentloaded",
+    });
+    await page.waitForSelector('[data-testid="lens-panel"]', { timeout: 15000 });
+    await page.waitForSelector('[data-testid="lens-origin"]', { timeout: 15000 });
+    const origin = await page.getByTestId("lens-origin").innerText();
+    if (!origin.includes("inventory") || !origin.toLowerCase().includes("inference")) {
+      throw new Error(`lens origin card wrong: ${origin}`);
+    }
+    ok("lens names inventory as the origin, flagged as inference");
+    const chain = await page.getByTestId("lens-chain").innerText();
+    if (!chain.includes("traffic stopped")) {
+      throw new Error(`lens chain misses the traffic stop: ${chain}`);
+    }
+    ok("lens chain lists the dependency impact with timestamps");
+    await page.waitForTimeout(1500);
+    await page.screenshot({ path: "atlas-ui-lens.png" });
+
+    // A finding's timestamp jumps straight into Replay at that moment.
+    await page
+      .locator('[data-testid="lens-finding"] .lens-time')
+      .first()
+      .click();
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector('[data-testid="time-mode"]');
+        return el && el.textContent && el.textContent.includes("viewing");
+      },
+      undefined,
+      { timeout: 10000 },
+    );
+    ok("lens finding jumps into Replay at the recorded moment");
+
+    // Focus the suspected origin from the Lens.
+    await page.getByTestId("btn-lens-focus-origin").click();
+    await page.waitForFunction(
+      () => document.querySelectorAll(".node.dimmed").length >= 1,
+      undefined,
+      { timeout: 10000 },
+    );
+    ok("lens focuses the suspected origin on the map");
+    await page.screenshot({ path: "atlas-ui-lens-focus.png" });
+    await page.getByTestId("btn-lens-close").click();
+
+    // The header button opens a live investigation of the trailing
+    // window without a hand-built URL.
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await page.getByTestId("btn-lens").click();
+    await page.waitForSelector('[data-testid="lens-panel"]', { timeout: 10000 });
+    ok("lens opens from the header over the trailing window");
   }
 
   console.log(`UI E2E OK: ${checks.length} interactions verified`);

@@ -14,6 +14,11 @@ const (
 	LifeOOM   = "oom"
 )
 
+// DetailExitClean is the recorded detail of an orderly exit(0). The
+// Incident Lens keys on it: a clean exit is normal lifecycle, never a
+// primary incident event.
+const DetailExitClean = "exited cleanly"
+
 // crashSignals are the "something is wrong" terminations; ordinary
 // SIGTERM/SIGINT/SIGKILL deaths stay plain exits (SIGKILL from the OOM
 // killer arrives as its own event).
@@ -89,7 +94,7 @@ func decodeExit(code int32) (string, string) {
 	}
 	status := int(code >> 8)
 	if status == 0 {
-		return LifeExit, "exited cleanly"
+		return LifeExit, DetailExitClean
 	}
 	return LifeExit, fmt.Sprintf("exited with status %d", status)
 }

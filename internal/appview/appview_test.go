@@ -100,7 +100,7 @@ func TestProjectGroupsAndClassifies(t *testing.T) {
 	}
 
 	// External endpoints collapse into one aggregate.
-	ext := nodeByID(g, externalID)
+	ext := nodeByID(g, ExternalID)
 	if ext == nil || ext.MemberCount != 2 || ext.Category != CategoryExternal {
 		t.Fatalf("external = %+v", ext)
 	}
@@ -127,7 +127,7 @@ func TestProjectAggregatesEdges(t *testing.T) {
 	// dockerd -> external: two raw endpoints, one aggregate edge.
 	var extEdge *Edge
 	for i := range g.Edges {
-		if g.Edges[i].Src == "svc:proc:dockerd" && g.Edges[i].Dst == externalID {
+		if g.Edges[i].Src == "svc:proc:dockerd" && g.Edges[i].Dst == ExternalID {
 			extEdge = &g.Edges[i]
 		}
 	}

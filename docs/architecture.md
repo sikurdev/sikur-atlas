@@ -152,6 +152,72 @@ otherwise short ids are shown. Listening ports come from accepted
 connections plus a periodic `/proc/net/tcp{,6}` scan across network
 namespaces with inode→pid attribution.
 
+## Startup state seeding (internal/procfs, internal/collector/seed.go)
+
+An agent that only watches state *transitions* starts blind to every
+connection that already exists. v0.4 closes that gap by seeding the live
+graph from the kernel's own socket tables, once, at startup:
+
+**What is read.** The same per-namespace `/proc/<pid>/net/tcp{,6}` walk
+that finds listeners also parses ESTABLISHED rows (stable text ABI, no
+new privileges): local/remote tuple and socket inode, per network
+namespace, so container connections are seen exactly like host ones.
+Other states (handshakes in flight, TIME_WAIT and friends) are
+deliberately skipped — they are not standing connections, and their
+imminent transitions arrive as live events anyway. Pre-existing AF_UNIX
+pairs were already covered in v0.3 by the sock_diag scan.
+
+**Attribution.** Socket inode → owning pid via the same `/proc` fd walk
+the listen scan uses; pid → identity through the ordinary resolver
+(container id, executable). A socket no process was found holding
+resolves to an external node by address — stated as unattributed, never
+guessed. Direction comes from kernel evidence: the half covered by a
+same-namespace listener (same port, wildcard or exact address) is the
+accepted side. A local↔local connection contributes two mirrored halves
+that merge by canonical tuple, like live records. With no listener
+evidence at all, the lower port is taken as the server — the same last
+resort the live correlator uses — and counted in
+`/api/meta`'s `seedDirHeuristic`.
+
+**Truthful counters.** A seeded connection raises the edge's active
+gauge and its `seededConns` marker, but never the cumulative
+`Connections` count: the open was not observed, and inventing one would
+fake a connection rate. `seededConns` is the uncertainty made explicit —
+"of the standing connections here, this many predate the agent". In
+history it lands through the same gauge-only path as AF_UNIX standing
+pairs.
+
+**Reconciliation with live events.** The seed scan runs *after* the BPF
+programs attach, so every later close is observed:
+
+- a close event whose socket the correlator never tracked is matched
+  against the seeds by tuple; the seed is released exactly once (the
+  twin socket's close finds it gone), the close event's lifetime byte
+  counters — which the kernel keeps per socket, RFC 4898 — fold into
+  the edge, mirrored when the closing socket was the server side, and
+  the final RTT estimate is sampled;
+- closes that arrive *while the scan is still walking /proc* are
+  remembered and inoculate the seed pass, so a connection that died
+  mid-scan is not resurrected (the buffer is dropped once seeding
+  completes);
+- a live connection establishing on a seeded tuple proves the seeded
+  socket is gone (two established sockets cannot share a 4-tuple): the
+  seed expires before the new record counts, so actives never double;
+- every subsequent scan re-verifies surviving seeds against the socket
+  table: a seed whose close event was lost (ring overflow) expires
+  within one scan interval. Scans only ever *retire* seeds — new
+  connections belong to the event stream. Seeds are exempt from the
+  idle TTL for the same reason: they are re-verified by evidence, not
+  by silence.
+
+**What seeding cannot know**, stated rather than guessed: retransmit
+and reset events carry only the kernel socket address, which a seeded
+connection's tuple cannot be matched against — so pre-existing
+connections carry no retransmit/reset attribution until they close.
+Bytes and RTT arrive with the close, as for any connection. History
+before the agent started obviously stays unrecorded; the seed makes the
+*present* truthful, not the past.
+
 ## AF_UNIX topology (internal/unixdiag, internal/collector/unix.go)
 
 Two independent evidence paths, deliberately kept apart because they
@@ -305,9 +371,102 @@ normalized so A is always the earlier moment.
 
 `internal/api` serves `GET /api/graph[?at=]`, `GET /api/appview[?at=]`,
 `GET /api/compare?a=&b=`, `GET /api/timeline?from=&to=&step=`,
+`GET /api/lens?from=&to=[&service=]`,
 `GET /api/stream` (SSE; each event carries the raw snapshot *and* its
 projection so the client never needs a second round trip), `GET
 /api/meta`, and the embedded UI.
+
+## Incident Lens (internal/lens)
+
+The Lens turns a recorded window into a deterministic investigation: a
+chronological chain of findings, an origin named only when the evidence
+supports it, the observed blast radius, and recovery. Three properties
+are load-bearing:
+
+- **Facts first.** Every finding is recorded data — a lifecycle event,
+  an edge health bucket, a presence row, a resource bucket — with its
+  timestamps and the raw numbers attached as evidence. Exactly two
+  things in a report are inference, and both say so in the payload
+  (`"inference": true`): the origin and the propagation links.
+- **Deterministic.** The rules are fixed constants and functions (rule
+  set `lens/v1`, named in every report); the same recorded window
+  always produces the byte-identical report. No model, no scores, no
+  LLM.
+- **Honest about resolution.** Every finding is a time *interval*
+  (its bucket span; one second for lifecycle events). Order is only
+  claimed between non-overlapping intervals — what happened first
+  *within* one bucket is not knowable, and the Lens says "unresolved"
+  rather than pretending otherwise.
+
+The Lens works at service level (the same appview projection the UI
+shows), over one reconstruction whose presence window covers the whole
+investigated range, so a service alive only mid-window still maps.
+
+### Findings (lens/v1)
+
+Terminal primaries — something stopped existing or was killed:
+
+| kind | rule |
+| --- | --- |
+| `oom` | lifecycle event: the kernel OOM killer chose a process |
+| `oom-cgroup` | `memory.events oom_kill` delta, unless the lifecycle event for the same kill (same service, same bucket) is present |
+| `crash` | lifecycle event: fatal-signal death |
+| `exit` | lifecycle event: non-clean exit (signal or non-zero status). A clean `exit(0)` is recorded as neutral `exit-clean` — every short-lived tool would otherwise read as an incident |
+| `service-gone` | a service that had listening presence produces no presence rows for ≥ 90 s (three missed 30 s listen scans) |
+| `listen-lost` | presence continues but listening flips true → false |
+
+Contributing pressure — may anchor an origin only when no terminal
+primary exists: `rss-pressure` (RSS crosses 90 % of the memory limit)
+and `throttle` (≥ 500 ms cgroup CPU throttling in one bucket).
+
+Transitions — a dependency edge's health changed:
+
+| kind | rule |
+| --- | --- |
+| `failures-start` | failed connects appear in a bucket after an in-window clean bucket (or on an edge first seen inside the window) |
+| `resets-spike` / `retrans-spike` | ≥ 1 reset / ≥ 3 retransmits in a bucket after a clean one (first spike per edge) |
+| `traffic-stop` | an edge active in ≥ 4 buckets falls silent (no opens or closes) for ≥ 90 s — the steadiness bar keeps CLI-style burst edges from reading as incidents |
+
+Recovery: `failures-end` (failures gone *with* traffic flowing — silence
+is not recovery), `traffic-resume`, `service-back`, and `exec` (restart
+evidence). An edge already failing at the window start is **chronic**:
+reported as context, excluded from transitions and origin logic — a
+long-broken dependency must not hijack every later incident.
+
+### The origin rule
+
+`earliest-primary-with-dependency-support`: the earliest primary
+finding anchors the incident **only when** every other primary strictly
+follows it *and* transitively depends on it (a cascade), no transition
+strictly precedes it, and every transition's target service is the
+candidate or transitively depends on it over the window's recorded
+edges. Any violation names the reason and reports unresolved: two
+same-interval primaries on different services, an independent primary,
+failures that predate every primary, or impact with no dependency path.
+With no primary at all, failures alone stay unresolved ("the cause may
+predate the window or be outside the host").
+
+Two deliberate exclusions, both stated in the docs because they shape
+what the Lens can say:
+
+- **Atlas excludes itself.** The agent's own service and its API
+  clients' edges toward it are the observer, not subjects.
+- **The external aggregate gates nothing.** Transitions on edges toward
+  `svc:external` are recorded facts, but what happens beyond the host
+  can be neither explained nor refuted by local evidence — they neither
+  veto nor support an origin, and dependency paths never traverse
+  *through* the aggregate (its members are unrelated endpoints).
+
+Blast radius is observed impact — services and edges carrying
+non-chronic degradation findings — not reachability speculation.
+Recovery pairs each degradation with the recorded evidence of its end,
+or says "no recovery recorded within the window".
+
+The UI's Lens panel renders the report next to the map: each finding
+jumps Replay to its moment, the origin can be focused (the same
+transitive-closure dimming as Focus), and every finding's evidence rows
+expand in place. The investigation window and focus service live in the
+URL (`?lf=&lt=[&ls=]`), so an investigation is a shareable address.
 
 ## UI (web/)
 
@@ -338,9 +497,15 @@ straight from `/api/compare` output. There is no inference layer.
 
 ## Known limitations
 
-- Connections established before the agent started are invisible until
-  they close; the first moments of history after an agent (re)start are
-  correspondingly thin.
+- Startup seeding covers *standing* state: TCP connections that were
+  ESTABLISHED (and listeners) when the agent started. History before
+  the agent start stays unrecorded; a seeded connection carries no
+  retransmit/reset attribution (those events identify sockets by
+  kernel address, which the seed cannot know) and no byte counts until
+  it closes; seed direction without listener evidence falls back to the
+  lower-port heuristic (counted in `/api/meta`). A connection whose
+  close event is lost lingers as active for at most one scan interval
+  (30 s) before re-verification expires it.
 - Bytes and the mature RTT sample only arrive when a connection closes;
   a long-lived connection shows activity (presence, retransmits, resets)
   but not throughput until teardown.
@@ -373,7 +538,15 @@ straight from `/api/compare` output. There is no inference layer.
   first window appears ~20 s after it does. PSI lines require kernel
   PSI support (`CONFIG_PSI=y`, default on mainstream distros).
 - Compare answers with recorded facts; it does not rank causes. The
-  ordering of "what broke first" within one bucket is not knowable.
+  ordering of "what broke first" within one bucket is not knowable —
+  which is also why the Incident Lens treats findings as intervals and
+  reports unresolved when primaries overlap.
+- The Lens sees what Atlas records: an incident whose cause left no
+  kernel-visible trace (a config change, a slow disk on another host, a
+  bug that degrades responses without touching connections, lifecycle
+  of a process that was never on the map) yields findings without a
+  supported origin — reported as unresolved, not papered over. Its
+  windows are bounded by retention like everything else.
 
 ## Trust boundaries and failure modes
 
@@ -381,10 +554,11 @@ straight from `/api/compare` output. There is no inference layer.
   drops are counted and surfaced in the UI footer.
 - Pid attribution can miss a process that exits before `/proc` is read;
   the kernel-provided comm is kept as fallback identity.
-- Connections established before the agent started are invisible until
-  they close (no state transition to observe). A `/proc/net` seed scan
-  at startup is the obvious next step and slots into the collector
-  without schema changes.
+- Startup seeding closes the pre-existing-connection gap (see its
+  section above); the races it cannot fully erase — a connection dying
+  in the instants around the seed scan — are bounded to one scan
+  interval by re-verification, and biased toward under-reporting
+  (skipping) rather than inventing state.
 - Tracking state is capped by a 1-hour idle TTL. An established
   connection produces no events while it lives, so a connection
   outliving the TTL ages out: its edge's active count is released, and

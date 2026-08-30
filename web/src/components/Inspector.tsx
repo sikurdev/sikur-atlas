@@ -25,6 +25,8 @@ interface Props {
   onFocus: (id: string | null) => void;
   onShowRaw: (query: string) => void;
   rawView: boolean;
+  // Open the Incident Lens focused on a service (services view only).
+  onLens?: (service: string) => void;
 }
 
 const KIND_TITLES: Record<string, string> = {
@@ -128,6 +130,7 @@ function NodeDetails({
   onFocus,
   onShowRaw,
   rawView,
+  onLens,
 }: Props & { node: DisplayNode }) {
   const outgoing = graph.edges.filter((e) => e.src === node.id);
   const incoming = graph.edges.filter((e) => e.dst === node.id);
@@ -167,6 +170,16 @@ function NodeDetails({
             data-testid="btn-raw"
           >
             Raw connections
+          </button>
+        )}
+        {onLens && node.category !== "external" && (
+          <button
+            className="pill"
+            onClick={() => onLens(node.id)}
+            data-testid="btn-node-lens"
+            title="Investigate this service's recent window from recorded evidence"
+          >
+            ⌖ Investigate
           </button>
         )}
       </div>
@@ -444,6 +457,17 @@ function EdgeDetails({ edge, graph }: Props & { edge: DisplayEdge }) {
         <dd>{formatCount(w ? w.opens : edge.connections)}</dd>
         <dt>active now</dt>
         <dd>{edge.activeConns}</dd>
+        {(edge.raw?.seededConns ?? edge.app?.seededConns ?? 0) > 0 && (
+          <>
+            <dt>seeded</dt>
+            <dd
+              data-testid="edge-seeded"
+              title="Standing connections discovered from the kernel socket tables at agent startup; they predate Atlas, so they count as active but never as observed opens"
+            >
+              {edge.raw?.seededConns ?? edge.app?.seededConns} pre-existing
+            </dd>
+          </>
+        )}
         <dt>failed</dt>
         <dd className={(w ? w.failures : edge.failures) > 0 ? "trouble" : ""}>
           {w ? w.failures : edge.failures}

@@ -59,6 +59,7 @@ type Edge struct {
 	Path        string            `json:"path,omitempty"`
 	Connections uint64            `json:"connections"`
 	ActiveConns int64             `json:"activeConns"`
+	SeededConns int64             `json:"seededConns,omitempty"`
 	BytesSent   uint64            `json:"bytesSent"`
 	BytesRecv   uint64            `json:"bytesRecv"`
 	Failures    uint64            `json:"failures,omitempty"`
@@ -103,8 +104,10 @@ type Options struct {
 	SelfExe string
 }
 
-// externalID is the aggregate external node's id.
-const externalID = "svc:external"
+// ExternalID is the aggregate external node's id. Exported for the
+// Incident Lens, whose rules treat the external aggregate specially
+// (evidence about it can be neither explained nor refuted locally).
+const ExternalID = "svc:external"
 
 // Project computes the application view of snap.
 func Project(snap graph.Snapshot, opts Options) Graph {
@@ -117,7 +120,7 @@ func Project(snap graph.Snapshot, opts Options) Graph {
 	for i := range snap.Nodes {
 		n := &snap.Nodes[i]
 		if n.Kind == graph.NodeExternal {
-			nodeToSvc[n.ID] = externalID
+			nodeToSvc[n.ID] = ExternalID
 			externalMembers = append(externalMembers, n.ID)
 			if extFirst.IsZero() || n.FirstSeen.Before(extFirst) {
 				extFirst = n.FirstSeen
@@ -161,8 +164,8 @@ func Project(snap graph.Snapshot, opts Options) Graph {
 	}
 	if len(externalMembers) > 0 {
 		slices.Sort(externalMembers)
-		svcNodes[externalID] = &Node{
-			ID:        externalID,
+		svcNodes[ExternalID] = &Node{
+			ID:        ExternalID,
 			Label:     "external",
 			Category:  CategoryExternal,
 			Kind:      "external",
@@ -199,6 +202,7 @@ func Project(snap graph.Snapshot, opts Options) Graph {
 		}
 		se.Connections += e.Connections
 		se.ActiveConns += e.ActiveConns
+		se.SeededConns += e.SeededConns
 		se.BytesSent += e.BytesSent
 		se.BytesRecv += e.BytesRecv
 		se.Failures += e.Failures

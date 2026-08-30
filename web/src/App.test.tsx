@@ -111,6 +111,81 @@ function payload(): StreamPayload {
   };
 }
 
+// A canned /api/lens report shaped like the demo incident: nginx died,
+// curl→nginx traffic stopped.
+function lensReport() {
+  const t = new Date("2026-08-30T12:02:00Z");
+  const iso = (off: number) => new Date(t.getTime() + off * 1000).toISOString();
+  const exit = {
+    kind: "exit",
+    time: iso(0),
+    end: iso(1),
+    service: "svc:proc:nginx",
+    label: "nginx",
+    detail: "process exited: killed by signal 15",
+    evidence: [
+      { source: "lifecycle-event", time: 100, detail: "kind=exit pid=9" },
+    ],
+  };
+  const stop = {
+    kind: "traffic-stop",
+    time: iso(10),
+    end: iso(20),
+    service: "svc:proc:curl",
+    label: "curl",
+    edge: "svc:proc:curl->svc:proc:nginx:80",
+    edgeSrc: "svc:proc:curl",
+    edgeDst: "svc:proc:nginx",
+    detail: "traffic ceased: no opens or closes for 120s",
+    evidence: [
+      {
+        source: "edge-bucket",
+        time: 100,
+        spanSecs: 10,
+        detail: "opens=5 closes=5 failures=0 resets=0 retrans=0",
+      },
+    ],
+  };
+  return {
+    from: iso(-600),
+    to: iso(300),
+    ruleSet: "lens/v1",
+    findings: [exit, stop],
+    chronic: [],
+    origin: {
+      service: "svc:proc:nginx",
+      label: "nginx",
+      time: iso(0),
+      findingIndex: 0,
+      rule: "earliest-primary-with-dependency-support",
+      inference: true,
+      explanation: "exit is the earliest primary event",
+    },
+    propagations: [
+      {
+        causeIndex: 0,
+        effectIndex: 1,
+        inference: true,
+        explanation: "consistent with propagation",
+      },
+    ],
+    blastRadius: {
+      services: ["svc:proc:curl", "svc:proc:nginx"],
+      edges: ["svc:proc:curl->svc:proc:nginx:80"],
+    },
+    recovery: [
+      {
+        subject: "svc:proc:nginx",
+        degradedIndex: 0,
+        recoveredAt: null,
+        recoveryIndex: -1,
+        detail: "no recovery recorded within the window",
+      },
+    ],
+    labels: { "svc:proc:curl": "curl", "svc:proc:nginx": "nginx" },
+  };
+}
+
 describe("App", () => {
   let source: FakeEventSource;
 
@@ -154,6 +229,15 @@ describe("App", () => {
               changedEdges: [],
             }),
           };
+        }
+        if (url.startsWith("/api/lens")) {
+          return { ok: true, json: async () => lensReport() };
+        }
+        if (url.startsWith("/api/graph")) {
+          return { ok: true, json: async () => payload().raw };
+        }
+        if (url.startsWith("/api/appview")) {
+          return { ok: true, json: async () => payload().app };
         }
         return { ok: false, status: 404, json: async () => ({}) };
       }),
@@ -259,5 +343,81 @@ describe("App", () => {
       });
     });
     expect(screen.getByText(/make one:/)).toBeTruthy();
+  });
+
+  it("opens the Incident Lens, shows the chain, and jumps to Replay", async () => {
+    renderApp();
+    act(() => {
+      source.emit("snapshot", payload());
+    });
+    fireEvent.click(screen.getByTestId("btn-lens"));
+    expect(screen.getByTestId("lens-panel")).toBeTruthy();
+
+    // The report arrives: origin card, evidence chain, blast radius.
+    expect(await screen.findByTestId("lens-origin")).toBeTruthy();
+    expect(screen.getByTestId("lens-origin").textContent).toContain("nginx");
+    expect(screen.getByTestId("lens-origin").textContent).toContain(
+      "inference",
+    );
+    const findings = screen.getAllByTestId("lens-finding");
+    expect(findings).toHaveLength(2);
+    expect(findings[0]!.getAttribute("data-kind")).toBe("exit");
+    expect(findings[1]!.getAttribute("data-kind")).toBe("traffic-stop");
+    expect(screen.getByTestId("lens-blast")).toBeTruthy();
+    expect(screen.getByTestId("lens-recovery").textContent).toContain(
+      "no recovery recorded",
+    );
+
+    // The URL is addressable.
+    expect(window.location.search).toContain("lf=");
+    expect(window.location.search).toContain("lt=");
+
+    // Clicking a finding's time jumps into Replay at that moment.
+    const timeBtn = findings[0]!.querySelector("button.lens-time")!;
+    fireEvent.click(timeBtn);
+    expect(screen.getByTestId("time-mode").textContent?.toLowerCase()).toContain(
+      "viewing",
+    );
+    expect(window.location.search).toContain("at=");
+
+    // Focus origin dims via the same focus mechanism as the pill.
+    fireEvent.click(screen.getByTestId("btn-lens-focus-origin"));
+    // nginx selected via origin name → inspector should offer Unfocus
+    // (await the replay snapshot fetch resolving into the graph).
+    const nameBtn = screen
+      .getByTestId("lens-origin")
+      .querySelector("button.linkish")!;
+    fireEvent.click(nameBtn);
+    expect((await screen.findByTestId("btn-focus")).textContent).toBe(
+      "Unfocus",
+    );
+
+    // Close removes the panel and clears the URL keys.
+    fireEvent.click(screen.getByTestId("btn-lens-close"));
+    expect(screen.queryByTestId("lens-panel")).toBeNull();
+    expect(window.location.search).not.toContain("lf=");
+  });
+
+  it("investigates a selected service from the inspector", async () => {
+    renderApp();
+    act(() => {
+      source.emit("snapshot", payload());
+    });
+    const target = document.querySelector('[data-node-id="svc:proc:nginx"]')!;
+    fireEvent.pointerDown(target);
+    fireEvent.pointerUp(target);
+    fireEvent.click(screen.getByTestId("btn-node-lens"));
+    expect(await screen.findByTestId("lens-origin")).toBeTruthy();
+    expect(window.location.search).toContain("ls=svc%3Aproc%3Anginx");
+  });
+
+  it("reopens the lens from the URL", async () => {
+    window.history.replaceState(null, "", "/?lf=1000&lt=2000");
+    renderApp();
+    act(() => {
+      source.emit("snapshot", payload());
+    });
+    expect(screen.getByTestId("lens-panel")).toBeTruthy();
+    expect(await screen.findByTestId("lens-origin")).toBeTruthy();
   });
 });

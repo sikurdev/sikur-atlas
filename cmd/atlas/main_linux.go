@@ -123,6 +123,7 @@ func run(listen, dockerSocket, dbPath string, scanInterval time.Duration) error 
 		}
 	}()
 	go func() {
+		seeded := false
 		scan := func() {
 			res := procfs.ScanSockets()
 			listeners := make([]collector.Listener, len(res.Listeners))
@@ -132,6 +133,27 @@ func run(listen, dockerSocket, dbPath string, scanInterval time.Duration) error 
 				}
 			}
 			corr.SyncListeners(listeners, time.Now())
+			// Startup state: the first scan seeds connections that were
+			// established before the agent started (the BPF programs are
+			// already attached, so their eventual closes reconcile);
+			// every later scan re-verifies surviving seeds against the
+			// kernel's socket table.
+			estab := make([]collector.SeedConn, len(res.Established))
+			for i, e := range res.Established {
+				estab[i] = collector.SeedConn{
+					PID: e.PID, Comm: e.Comm,
+					Local: e.Local, Remote: e.Remote,
+					LocalListen: e.LocalListen,
+				}
+			}
+			if !seeded {
+				corr.SeedConnections(estab, time.Now())
+				seeded = true
+				st := corr.Stats()
+				log.Printf("seeded %d pre-existing TCP connections from the kernel socket tables", st.SeededConns)
+			} else {
+				corr.ReconcileSeeds(estab, time.Now())
+			}
 			// AF_UNIX topology: exact peer pairing from the kernel's
 			// own socket table, dumped in every network namespace
 			// (container sockets are invisible from the host's).

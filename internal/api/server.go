@@ -14,6 +14,7 @@ import (
 	"github.com/sikurdev/sikur-atlas/internal/appview"
 	"github.com/sikurdev/sikur-atlas/internal/graph"
 	"github.com/sikurdev/sikur-atlas/internal/history"
+	"github.com/sikurdev/sikur-atlas/internal/lens"
 )
 
 // Meta describes the running agent for /api/meta.
@@ -67,6 +68,7 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("GET /api/stream", s.handleStream)
 	mux.HandleFunc("GET /api/timeline", s.handleTimeline)
 	mux.HandleFunc("GET /api/compare", s.handleCompare)
+	mux.HandleFunc("GET /api/lens", s.handleLens)
 	mux.HandleFunc("GET /api/lifecycle", s.handleLifecycle)
 	mux.HandleFunc("GET /api/metrics", s.handleMetrics)
 	mux.HandleFunc("GET /api/meta", s.handleMeta)
@@ -270,6 +272,43 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, diff)
+}
+
+// handleLens runs the Incident Lens over a recorded window:
+// GET /api/lens?from=&to=[&service=]. service focuses the investigation
+// on one service's dependency component.
+func (s *Server) handleLens(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.History == nil {
+		http.Error(w, "history disabled", http.StatusNotFound)
+		return
+	}
+	q := r.URL.Query()
+	from, errF := parseTime(q.Get("from"))
+	to, errT := parseTime(q.Get("to"))
+	if errF != nil || errT != nil {
+		http.Error(w, "lens needs from= and to= timestamps", http.StatusBadRequest)
+		return
+	}
+	if from.After(to) {
+		from, to = to, from
+	}
+	if !to.After(from) {
+		http.Error(w, "lens window is empty", http.StatusBadRequest)
+		return
+	}
+	// Bound the window: beyond retention there is nothing to read, and
+	// an unbounded range would only scan empty space.
+	if to.Sub(from) > 24*time.Hour {
+		http.Error(w, "lens window exceeds 24h", http.StatusBadRequest)
+		return
+	}
+	report, err := lens.Run(s.cfg.History, from, to, q.Get("service"),
+		appview.Options{SelfExe: s.cfg.SelfExe})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, report)
 }
 
 // handleLifecycle serves recorded lifecycle events; node= filters by

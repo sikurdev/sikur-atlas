@@ -4,14 +4,17 @@ import {
   fetchAppViewAt,
   fetchCompare,
   fetchGraphAt,
+  fetchLens,
   useGraphStream,
   useMeta,
   type AppGraph,
   type Diff,
   type GraphSnapshot,
+  type LensReport,
 } from "./api";
 import { GraphCanvas } from "./components/GraphCanvas";
 import { Inspector } from "./components/Inspector";
+import { LensPanel } from "./components/LensPanel";
 import { Timeline, type TimeMode } from "./components/Timeline";
 import {
   applyFilters,
@@ -33,12 +36,21 @@ const STATUS_LABEL = {
 type ViewMode = "app" | "raw";
 type LayoutMode = "overview" | "explore";
 
+// LensRange is the recorded window an Incident Lens investigation runs
+// over, optionally focused on one service's dependency component.
+export interface LensRange {
+  from: number;
+  to: number;
+  service?: string;
+}
+
 interface UrlState {
   view: ViewMode;
   layout: LayoutMode;
   showSystem: boolean;
   at: number | null;
   compare: { a: number; b: number } | null;
+  lens: LensRange | null;
 }
 
 function readURL(): UrlState {
@@ -49,12 +61,19 @@ function readURL(): UrlState {
   };
   const a = num("a");
   const b = num("b");
+  const lf = num("lf");
+  const lt = num("lt");
+  const ls = p.get("ls");
   return {
     view: p.get("view") === "raw" ? "raw" : "app",
     layout: p.get("layout") === "explore" ? "explore" : "overview",
     showSystem: p.get("sys") === "1",
     at: num("at"),
     compare: a != null && b != null ? { a, b } : null,
+    lens:
+      lf != null && lt != null
+        ? { from: lf, to: lt, ...(ls ? { service: ls } : {}) }
+        : null,
   };
 }
 
@@ -68,6 +87,11 @@ function writeURL(s: UrlState) {
     p.set("b", String(s.compare.b));
   } else if (s.at != null) {
     p.set("at", String(s.at));
+  }
+  if (s.lens) {
+    p.set("lf", String(s.lens.from));
+    p.set("lt", String(s.lens.to));
+    if (s.lens.service) p.set("ls", s.lens.service);
   }
   const qs = p.toString();
   window.history.replaceState(null, "", qs ? `?${qs}` : window.location.pathname);
@@ -96,9 +120,35 @@ export function App({ makeSource }: { makeSource?: () => EventSource }) {
   const [diff, setDiff] = useState<Diff | null>(null);
   const [compareB, setCompareB] = useState<AppGraph | null>(null);
 
+  // Incident Lens: the investigated window and its report.
+  const [lens, setLens] = useState<LensRange | null>(initial.lens);
+  const [lensReport, setLensReport] = useState<LensReport | null>(null);
+  const [lensError, setLensError] = useState<string | null>(null);
+
   useEffect(() => {
-    writeURL({ view, layout, showSystem, at, compare });
-  }, [view, layout, showSystem, at, compare]);
+    writeURL({ view, layout, showSystem, at, compare, lens });
+  }, [view, layout, showSystem, at, compare, lens]);
+
+  useEffect(() => {
+    if (lens == null) {
+      setLensReport(null);
+      setLensError(null);
+      return;
+    }
+    let stale = false;
+    setLensReport(null);
+    setLensError(null);
+    fetchLens(lens.from, lens.to, lens.service)
+      .then((r) => {
+        if (!stale) setLensReport(r);
+      })
+      .catch((err: unknown) => {
+        if (!stale) setLensError(String(err));
+      });
+    return () => {
+      stale = true;
+    };
+  }, [lens]);
 
   useEffect(() => {
     if (at == null) {
@@ -230,6 +280,24 @@ export function App({ makeSource }: { makeSource?: () => EventSource }) {
     setFocusId(null);
   }, []);
 
+  // Open the Lens over the mode's natural window: the compared span, the
+  // 15 minutes up to the replayed moment, or the trailing 15 minutes.
+  // Lens findings are service-level, so the Services view is implied.
+  const openLens = useCallback(
+    (service?: string) => {
+      const now = Math.floor(Date.now() / 1000);
+      const range =
+        compare != null
+          ? { from: compare.a, to: compare.b }
+          : at != null
+            ? { from: at - 900, to: at }
+            : { from: now - 900, to: now };
+      setLens(service ? { ...range, service } : range);
+      if (view !== "app") switchView("app");
+    },
+    [at, compare, view, switchView],
+  );
+
   const statusLabel =
     mode.kind === "live"
       ? STATUS_LABEL[status]
@@ -286,6 +354,16 @@ export function App({ makeSource }: { makeSource?: () => EventSource }) {
             system
           </label>
         )}
+        {(meta?.history ?? true) && (
+          <button
+            className={`pill lens-toggle${lens != null ? " on" : ""}`}
+            onClick={() => (lens != null ? setLens(null) : openLens())}
+            data-testid="btn-lens"
+            title="Investigate this window from recorded evidence"
+          >
+            ⌖ Lens
+          </button>
+        )}
         <span className="spacer" />
         <input
           className="search"
@@ -317,6 +395,26 @@ export function App({ makeSource }: { makeSource?: () => EventSource }) {
           focus={focusSets}
           refTimeMs={refTimeMs}
         />
+        {lens != null && (
+          <LensPanel
+            report={lensReport}
+            error={lensError}
+            onClose={() => setLens(null)}
+            onJump={(t) => {
+              setAt(t);
+              setCompare(null);
+              setPinnedA(null);
+            }}
+            onSelect={setSelection}
+            onFocus={setFocusId}
+            onCompareAround={(a, b) => {
+              setCompare({ a, b });
+              setAt(null);
+              setPinnedA(null);
+              setSelection(null);
+            }}
+          />
+        )}
         <Inspector
           graph={filtered}
           selection={selection}
@@ -331,6 +429,7 @@ export function App({ makeSource }: { makeSource?: () => EventSource }) {
             setQuery(q);
           }}
           rawView={view === "raw"}
+          onLens={view === "app" ? openLens : undefined}
         />
       </main>
 

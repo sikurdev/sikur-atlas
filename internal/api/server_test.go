@@ -410,3 +410,80 @@ func TestUIMissingIsExplicit(t *testing.T) {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
 }
+
+func TestLensEndpoint(t *testing.T) {
+	store, hist, srv := testServer(t, false)
+
+	// A tiny recorded incident: steady traffic, then the dependency's
+	// process exits and the edge goes silent.
+	base := time.Now().UTC().Add(-10 * time.Minute).Truncate(10 * time.Second)
+	a := graph.NodeSpec{ID: "proc:/bin/web", Kind: graph.NodeProcess, Label: "web", Exe: "/bin/web"}
+	b := graph.NodeSpec{ID: "proc:/bin/db", Kind: graph.NodeProcess, Label: "db", Exe: "/bin/db"}
+	edge := "proc:/bin/web->proc:/bin/db:5432"
+	for off := 0; off < 120; off += 10 {
+		at := base.Add(time.Duration(off) * time.Second)
+		store.ObserveConnection(a, b, 5432, at)
+		hist.EdgeOpened(edge, at)
+		hist.EdgeClosed(edge, 1, 1, 100, at.Add(time.Second))
+		if err := hist.Flush(at.Add(10 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hist.NodeEvent(b.ID, "exit", 9, "killed by signal 15", base.Add(121*time.Second))
+	if err := hist.Flush(base.Add(5 * time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	var report struct {
+		RuleSet string `json:"ruleSet"`
+		Origin  *struct {
+			Service   string `json:"service"`
+			Inference bool   `json:"inference"`
+		} `json:"origin"`
+		Findings []struct {
+			Kind     string `json:"kind"`
+			Evidence []any  `json:"evidence"`
+		} `json:"findings"`
+	}
+	url := fmt.Sprintf("%s/api/lens?from=%d&to=%d", srv.URL,
+		base.Unix(), base.Add(5*time.Minute).Unix())
+	getJSON(t, url, &report)
+	if report.RuleSet == "" {
+		t.Fatal("lens report missing ruleSet")
+	}
+	if report.Origin == nil || report.Origin.Service != "svc:proc:db" {
+		t.Fatalf("origin = %+v, want svc:proc:db", report.Origin)
+	}
+	if !report.Origin.Inference {
+		t.Fatal("origin must be flagged inference")
+	}
+	kinds := map[string]bool{}
+	for _, f := range report.Findings {
+		kinds[f.Kind] = true
+		if len(f.Evidence) == 0 {
+			t.Fatalf("finding without evidence: %+v", f)
+		}
+	}
+	if !kinds["exit"] || !kinds["traffic-stop"] {
+		t.Fatalf("expected exit and traffic-stop findings, got %v", kinds)
+	}
+
+	// Guards.
+	resp, err := http.Get(srv.URL + "/api/lens")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing params: got %d", resp.StatusCode)
+	}
+	resp, err = http.Get(fmt.Sprintf("%s/api/lens?from=%d&to=%d", srv.URL,
+		base.Unix(), base.Add(48*time.Hour).Unix()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("oversized window: got %d", resp.StatusCode)
+	}
+}

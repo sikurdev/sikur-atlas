@@ -38,12 +38,34 @@ type ListenSocket struct {
 	Inode uint64
 }
 
-const tcpStateListen = "0A"
+// EstabSocket is one ESTABLISHED-state row from /proc/net/tcp{,6}: a
+// standing connection as the kernel sees it from this socket's side.
+type EstabSocket struct {
+	Local  netip.AddrPort
+	Remote netip.AddrPort
+	Inode  uint64
+}
+
+const (
+	tcpStateEstablished = "01"
+	tcpStateListen      = "0A"
+)
 
 // ParseTCPListeners parses /proc/net/tcp or /proc/net/tcp6 content and
 // returns the LISTEN sockets.
 func ParseTCPListeners(r io.Reader) []ListenSocket {
-	var out []ListenSocket
+	listeners, _ := ParseTCPTable(r)
+	return listeners
+}
+
+// ParseTCPTable parses /proc/net/tcp or /proc/net/tcp6 content and
+// returns the LISTEN and ESTABLISHED sockets. Other states (handshakes
+// in flight, teardown states like TIME_WAIT/CLOSE_WAIT) are deliberately
+// skipped: they are not standing connections, and their imminent state
+// transitions are observed as live events anyway.
+func ParseTCPTable(r io.Reader) ([]ListenSocket, []EstabSocket) {
+	var listeners []ListenSocket
+	var estab []EstabSocket
 	sc := bufio.NewScanner(r)
 	first := true
 	for sc.Scan() {
@@ -53,7 +75,11 @@ func ParseTCPListeners(r io.Reader) []ListenSocket {
 		}
 		fields := strings.Fields(sc.Text())
 		// sl local_address rem_address st ... inode ...
-		if len(fields) < 10 || fields[3] != tcpStateListen {
+		if len(fields) < 10 {
+			continue
+		}
+		state := fields[3]
+		if state != tcpStateListen && state != tcpStateEstablished {
 			continue
 		}
 		addr, port, ok := parseHexAddrPort(fields[1])
@@ -64,9 +90,21 @@ func ParseTCPListeners(r io.Reader) []ListenSocket {
 		if err != nil {
 			continue
 		}
-		out = append(out, ListenSocket{Addr: addr, Port: port, Inode: inode})
+		if state == tcpStateListen {
+			listeners = append(listeners, ListenSocket{Addr: addr, Port: port, Inode: inode})
+			continue
+		}
+		raddr, rport, ok := parseHexAddrPort(fields[2])
+		if !ok {
+			continue
+		}
+		estab = append(estab, EstabSocket{
+			Local:  netip.AddrPortFrom(addr, port),
+			Remote: netip.AddrPortFrom(raddr, rport),
+			Inode:  inode,
+		})
 	}
-	return out
+	return listeners, estab
 }
 
 // parseHexAddrPort decodes the kernel's "0100007F:1F90" (v4) or 32-hex:port

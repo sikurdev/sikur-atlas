@@ -70,6 +70,18 @@ services:
     image: redis:7-alpine
     container_name: atlas-demo-cache
 
+  # Holds one idle Redis connection open forever. The e2e starts this
+  # (with cache) BEFORE the agent, proving startup seeding: Atlas must
+  # show the standing connection without any replacement traffic.
+  holdconn:
+    image: python:3.12-alpine
+    container_name: atlas-demo-holdconn
+    command: ["python", "/app/holdconn.py"]
+    volumes:
+      - ./services:/app:ro
+    depends_on:
+      - cache
+
   loadgen:
     image: python:3.12-alpine
     container_name: atlas-demo-loadgen

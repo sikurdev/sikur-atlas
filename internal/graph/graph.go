@@ -84,9 +84,13 @@ type Edge struct {
 	DstPort  uint16 `json:"dstPort"`
 	Protocol string `json:"protocol"`
 	// Path is the AF_UNIX socket path for protocol "unix" edges.
-	Path        string    `json:"path,omitempty"`
-	Connections uint64    `json:"connections"`
-	ActiveConns int64     `json:"activeConns"`
+	Path        string `json:"path,omitempty"`
+	Connections uint64 `json:"connections"`
+	ActiveConns int64  `json:"activeConns"`
+	// SeededConns counts how many of ActiveConns were discovered
+	// standing by the startup socket scan rather than observed opening —
+	// their opens predate the agent, so they are absent from Connections.
+	SeededConns int64     `json:"seededConns,omitempty"`
 	BytesSent   uint64    `json:"bytesSent"`
 	BytesRecv   uint64    `json:"bytesRecv"`
 	Failures    uint64    `json:"failures,omitempty"`
@@ -218,6 +222,67 @@ func (s *Store) ObserveConnection(src, dst NodeSpec, dstPort uint16, at time.Tim
 	}
 	s.bumpLocked()
 	return id
+}
+
+// SeedConnection records one standing connection discovered by the
+// startup socket scan: the active gauge rises, but the cumulative
+// Connections counter does not — the open was never observed, and
+// counting it would fake a connection rate.
+func (s *Store) SeedConnection(src, dst NodeSpec, dstPort uint16, at time.Time) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.upsertNodeLocked(src, at)
+	s.upsertNodeLocked(dst, at)
+
+	id := EdgeID(src.ID, dst.ID, dstPort)
+	e, ok := s.edges[id]
+	if !ok {
+		e = &Edge{
+			ID:        id,
+			Src:       src.ID,
+			Dst:       dst.ID,
+			DstPort:   dstPort,
+			Protocol:  "tcp",
+			FirstSeen: at,
+		}
+		s.edges[id] = e
+	}
+	e.ActiveConns++
+	e.SeededConns++
+	if at.After(e.LastSeen) {
+		e.LastSeen = at
+	}
+	s.bumpLocked()
+	return id
+}
+
+// SeedConnectionClosed releases one seeded standing connection: on an
+// observed close (countBytes) the close event's lifetime byte counters
+// are folded in; on expiry (socket vanished without a close event) only
+// the gauges drop.
+func (s *Store) SeedConnectionClosed(edgeID string, bytesSent, bytesRecv uint64, at time.Time, countBytes bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.edges[edgeID]
+	if !ok {
+		return
+	}
+	if e.ActiveConns > 0 {
+		e.ActiveConns--
+	}
+	if e.SeededConns > 0 {
+		e.SeededConns--
+	}
+	if countBytes {
+		e.BytesSent += bytesSent
+		e.BytesRecv += bytesRecv
+	}
+	if at.After(e.LastSeen) {
+		e.LastSeen = at
+	}
+	s.bumpLocked()
 }
 
 // ConnectionClosed folds a finished connection into its edge aggregate.

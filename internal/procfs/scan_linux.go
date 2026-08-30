@@ -62,9 +62,27 @@ func procPath(pid uint32, parts ...string) string {
 	return filepath.Join(append([]string{"/proc", strconv.FormatUint(uint64(pid), 10)}, parts...)...)
 }
 
+// EstabConn is one established TCP connection found by the socket-table
+// scan, attributed to its owning process where the fd walk found one.
+type EstabConn struct {
+	PID    uint32 // 0 = no owning process found (unattributable)
+	Comm   string // "" when PID is 0
+	Local  netip.AddrPort
+	Remote netip.AddrPort
+	Inode  uint64
+	// LocalListen reports whether the same network namespace has a
+	// listener covering Local (same port, wildcard or equal address) —
+	// kernel evidence that this socket is the accepted (server) side.
+	LocalListen bool
+}
+
 // ScanResult is one pass over /proc's socket-owning processes.
 type ScanResult struct {
 	Listeners []Listener
+	// Established holds every standing TCP connection across the scanned
+	// network namespaces; the startup seed and the seed re-verification
+	// both consume it.
+	Established []EstabConn
 	// InodeToPID maps any socket inode (TCP and unix alike) to the
 	// first process found holding it.
 	InodeToPID map[uint64]uint32
@@ -74,10 +92,10 @@ type ScanResult struct {
 	NetNSPids []uint32
 }
 
-// ScanSockets walks /proc once and returns every listening TCP socket
-// with its owning process, plus the socket-inode ownership map (which
-// also covers AF_UNIX sockets — inodes are inodes). Because
-// /proc/<pid>/net/tcp shows that pid's network namespace, one
+// ScanSockets walks /proc once and returns every listening and
+// established TCP socket with its owning process, plus the socket-inode
+// ownership map (which also covers AF_UNIX sockets — inodes are inodes).
+// Because /proc/<pid>/net/tcp shows that pid's network namespace, one
 // representative per namespace is parsed, which covers containers as
 // well as the host.
 func ScanSockets() ScanResult {
@@ -118,30 +136,70 @@ func ScanSockets() ScanResult {
 	}
 
 	var out []Listener
+	var estab []EstabConn
 	commCache := make(map[uint32]string)
 	for _, rep := range nsRep {
+		// One namespace at a time: listener coverage for the established
+		// rows must come from the same namespace's tables.
+		var nsListen []ListenSocket
+		var nsEstab []EstabSocket
 		for _, table := range []string{"net/tcp", "net/tcp6"} {
 			f, err := os.Open(procPath(rep, table))
 			if err != nil {
 				continue
 			}
-			socks := ParseTCPListeners(f)
+			listeners, established := ParseTCPTable(f)
 			f.Close()
-			for _, s := range socks {
-				pid, ok := inodeToPID[s.Inode]
-				if !ok {
-					continue
-				}
+			nsListen = append(nsListen, listeners...)
+			nsEstab = append(nsEstab, established...)
+		}
+		for _, s := range nsListen {
+			pid, ok := inodeToPID[s.Inode]
+			if !ok {
+				continue
+			}
+			comm, ok := commCache[pid]
+			if !ok {
+				comm = Comm(pid)
+				commCache[pid] = comm
+			}
+			out = append(out, Listener{PID: pid, Comm: comm, Addr: s.Addr, Port: s.Port})
+		}
+		for _, s := range nsEstab {
+			c := EstabConn{
+				Local:       s.Local,
+				Remote:      s.Remote,
+				Inode:       s.Inode,
+				LocalListen: listenerCovers(nsListen, s.Local),
+			}
+			if pid, ok := inodeToPID[s.Inode]; ok {
+				c.PID = pid
 				comm, ok := commCache[pid]
 				if !ok {
 					comm = Comm(pid)
 					commCache[pid] = comm
 				}
-				out = append(out, Listener{PID: pid, Comm: comm, Addr: s.Addr, Port: s.Port})
+				c.Comm = comm
 			}
+			estab = append(estab, c)
 		}
 	}
-	return ScanResult{Listeners: out, InodeToPID: inodeToPID, NetNSPids: nsPids}
+	return ScanResult{Listeners: out, Established: estab, InodeToPID: inodeToPID, NetNSPids: nsPids}
+}
+
+// listenerCovers reports whether a listener in the same namespace covers
+// the local end of an established socket: same port, and either a
+// wildcard bind or the exact address.
+func listenerCovers(listeners []ListenSocket, local netip.AddrPort) bool {
+	for _, l := range listeners {
+		if l.Port != local.Port() {
+			continue
+		}
+		if l.Addr.IsUnspecified() || l.Addr == local.Addr() {
+			return true
+		}
+	}
+	return false
 }
 
 func listPIDs() []uint32 {

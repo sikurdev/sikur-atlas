@@ -218,6 +218,7 @@ body {
   display: grid;
   grid-template-columns: 1fr 320px;
   min-height: 0;
+  position: relative;
 }
 
 .canvas-wrap {
@@ -670,6 +671,11 @@ button.linkish {
     grid-template-columns: 1fr;
     grid-template-rows: 1fr auto;
   }
+  .lens-panel {
+    width: auto;
+    right: 12px;
+    max-height: 55%;
+  }
   .canvas-wrap {
     border-right: none;
     border-bottom: 1px solid var(--ink);
@@ -677,4 +683,147 @@ button.linkish {
   .inspector {
     max-height: 40vh;
   }
+}
+
+/* ---------- incident lens ---------- */
+
+.lens-panel {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  bottom: 12px;
+  width: 360px;
+  overflow-y: auto;
+  background: var(--paper);
+  border: 1px solid var(--ink);
+  box-shadow: 3px 3px 0 rgba(31, 39, 51, 0.12);
+  padding: 12px 14px;
+  z-index: 5;
+  font-size: 13px;
+}
+
+.lens-panel h2 {
+  margin: 0;
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.lens-panel h3 {
+  margin: 14px 0 4px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+.lens-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.lens-toggle {
+  font: 600 12px var(--sans);
+}
+
+.lens-origin {
+  border: 1px solid var(--line);
+  background: var(--paper-inset);
+  padding: 8px 10px;
+  margin-top: 10px;
+}
+
+.lens-origin-name {
+  margin: 4px 0;
+  font-weight: 600;
+}
+
+.lens-explain {
+  margin: 4px 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.lens-badge {
+  font: 600 10px var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  margin-left: 6px;
+  border: 1px solid var(--line);
+  color: var(--ink-soft);
+  background: var(--paper);
+}
+
+.lens-badge.inference {
+  border-color: var(--water);
+  color: var(--water-deep);
+}
+
+.lens-chain {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.lens-finding {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line-faint);
+}
+
+.lens-finding.origin {
+  background: var(--paper-inset);
+}
+
+.lens-time {
+  font-family: var(--mono);
+}
+
+.lens-kind {
+  font: 600 11px var(--mono);
+}
+
+.lens-kind.warn {
+  color: var(--hazard);
+}
+
+.lens-kind.add {
+  color: var(--water-deep);
+}
+
+.lens-detail {
+  color: var(--ink-soft);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.lens-evidence summary,
+.lens-chronic summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--ink-soft);
+}
+
+.lens-evidence ul {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0 0 0 8px;
+  border-left: 2px solid var(--line-faint);
+}
+
+.lens-evidence li {
+  font-size: 11px;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+  padding: 1px 0;
+}
+
+.lens-panel .mono {
+  font-family: var(--mono);
+}
+
+.lens-panel .legend-note.warn {
+  color: var(--hazard);
 }
