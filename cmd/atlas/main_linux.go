@@ -108,6 +108,9 @@ func run(listen, dockerSocket, dbPath string, scanInterval time.Duration) error 
 	}
 	defer tracer.Close()
 	log.Printf("eBPF programs attached (inet_sock_set_state, tcp_retransmit_skb, tcp_receive_reset, sched_process_exec/exit, oom mark_victim, kprobes inet_csk_accept + unix_stream_connect)")
+	for _, m := range tracer.Missing() {
+		log.Printf("WARNING: this kernel cannot provide %s (kprobes unavailable?); running degraded — see /api/meta", m)
+	}
 
 	// Periodic work: correlator ticks and listening-socket scans.
 	go func() {
@@ -193,6 +196,7 @@ func run(listen, dockerSocket, dbPath string, scanInterval time.Duration) error 
 			DecodeErrors:     decodeErrors.Load(),
 			DockerEnrichment: enricher != nil,
 			History:          true,
+			Degraded:         tracer.Missing(),
 			HostPSI:          sampler.HostPressure(),
 		}
 	}

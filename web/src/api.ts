@@ -211,6 +211,7 @@ export interface MetaData {
   decodeErrors: number;
   dockerEnrichment: boolean;
   history: boolean;
+  degraded?: string[] | null;
 }
 
 export interface StreamPayload {

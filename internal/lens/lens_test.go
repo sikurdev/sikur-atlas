@@ -688,3 +688,59 @@ func TestTrafficStopNeedsSteadyActivity(t *testing.T) {
 		t.Fatalf("burst edge produced a traffic stop: %+v", f)
 	}
 }
+
+func TestSystemStatusExitIsNeutral(t *testing.T) {
+	in := oomInput()
+	// The CI runner's network tooling errors out (status 1) in the same
+	// second as the OOM — recorded, but it must not contest the origin.
+	in.SystemServices = map[string]bool{"svc:proc:networkctl": true}
+	in.Events = append(in.Events, LifeEvent{
+		Service: "svc:proc:networkctl", Kind: "exit",
+		Detail: "exited with status 1", Time: at(61),
+	})
+	rep := Investigate(in)
+	if rep.Origin == nil || rep.Origin.Service != "svc:users" {
+		t.Fatalf("system tool status-exit contested the origin: origin=%+v unresolved=%q",
+			rep.Origin, rep.Unresolved)
+	}
+	f := findKind(rep.Findings, KindExitStatus)
+	if f == nil || f.Service != "svc:proc:networkctl" {
+		t.Fatalf("status exit should still be recorded: %+v", rep.Findings)
+	}
+	for _, s := range rep.BlastRadius.Services {
+		if s == "svc:proc:networkctl" {
+			t.Fatalf("neutral status exit entered the blast radius: %+v", rep.BlastRadius)
+		}
+	}
+	// An *app* service's status exit stays primary: only infrastructure
+	// tools get the pass.
+	in2 := oomInput()
+	in2.Events = append(in2.Events, LifeEvent{
+		Service: "svc:zeta", Kind: "exit",
+		Detail: "exited with status 1", Time: at(10),
+	})
+	if rep2 := Investigate(in2); rep2.Origin != nil {
+		t.Fatalf("app status exit must stay primary: %+v", rep2.Origin)
+	}
+}
+
+func TestRecoveryAcceptsSameSecondRestart(t *testing.T) {
+	in := oomInput()
+	// The restart exec routinely lands within the same recorded second
+	// as the kill; recovery pairing accepts the tie.
+	for i := range in.Events {
+		if in.Events[i].Kind == "exec" {
+			in.Events[i].Time = at(61)
+		}
+	}
+	rep := Investigate(in)
+	var recovered bool
+	for _, r := range rep.Recovery {
+		if r.Subject == "svc:users" && r.RecoveredAt != nil {
+			recovered = true
+		}
+	}
+	if !recovered {
+		t.Fatalf("same-second restart not matched as recovery: %+v", rep.Recovery)
+	}
+}

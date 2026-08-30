@@ -27,7 +27,29 @@ type Tracer struct {
 	// monoBase converts CLOCK_MONOTONIC nanoseconds (bpf_ktime_get_ns)
 	// to wall time.
 	monoBase time.Time
+	// missing names capabilities that could not attach on this kernel
+	// (see Missing).
+	missing []string
 }
+
+// Capability names reported by Missing when the kernel cannot attach
+// the kprobe-based programs (e.g. built without CONFIG_KPROBES).
+const (
+	// MissingAcceptAttribution: no kretprobe on inet_csk_accept — the
+	// server side of connections cannot be attributed to its process
+	// and shows as an external endpoint (the documented semantics for
+	// an unidentified half).
+	MissingAcceptAttribution = "server-accept-attribution"
+	// MissingUnixConnectEvents: no probes on unix_stream_connect —
+	// AF_UNIX connect/failure rates are not counted. Standing AF_UNIX
+	// pairs still come from the sock_diag socket-table scan.
+	MissingUnixConnectEvents = "unix-connect-events"
+)
+
+// Missing lists capabilities this kernel could not provide, in
+// deterministic order; empty on any mainstream kernel. Callers surface
+// it loudly (log, /api/meta) — degradation is announced, never silent.
+func (t *Tracer) Missing() []string { return t.missing }
 
 // NewTracer loads the embedded BPF object into the kernel and attaches
 // both programs. Requires root or CAP_BPF+CAP_PERFMON (plus kernel
@@ -78,25 +100,36 @@ func NewTracer() (*Tracer, error) {
 		t.links = append(t.links, l)
 	}
 
+	// The kprobe-based programs are attribution enrichment, not the
+	// spine: a kernel that cannot attach kprobes at all (built without
+	// CONFIG_KPROBES — some hardened/minimal VM kernels) still gets the
+	// full tracepoint pipeline, the socket-table seed and the sock_diag
+	// scans. Refusing to start would serve nobody; degrading *silently*
+	// would be worse — so failures land in t.missing, which main logs
+	// and /api/meta exposes.
+
 	// AF_UNIX connect visibility: entry captures target path + inode,
-	// return reports the outcome.
-	ke, err := link.Kprobe("unix_stream_connect",
+	// return reports the outcome. Entry and return only make sense as a
+	// pair; if either fails, both are dropped.
+	ke, keErr := link.Kprobe("unix_stream_connect",
 		coll.Programs["atlas_unix_connect_entry"], nil)
-	if err != nil {
-		return nil, fmt.Errorf("attaching kprobe unix_stream_connect: %w", err)
+	if keErr == nil {
+		kr, err := link.Kretprobe("unix_stream_connect",
+			coll.Programs["atlas_unix_connect_ret"],
+			&link.KprobeOptions{RetprobeMaxActive: 128})
+		if err != nil {
+			kr, err = link.Kretprobe("unix_stream_connect",
+				coll.Programs["atlas_unix_connect_ret"], nil)
+		}
+		if err != nil {
+			ke.Close()
+			t.missing = append(t.missing, MissingUnixConnectEvents)
+		} else {
+			t.links = append(t.links, ke, kr)
+		}
+	} else {
+		t.missing = append(t.missing, MissingUnixConnectEvents)
 	}
-	t.links = append(t.links, ke)
-	kr, err := link.Kretprobe("unix_stream_connect",
-		coll.Programs["atlas_unix_connect_ret"],
-		&link.KprobeOptions{RetprobeMaxActive: 128})
-	if err != nil {
-		kr, err = link.Kretprobe("unix_stream_connect",
-			coll.Programs["atlas_unix_connect_ret"], nil)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("attaching kretprobe unix_stream_connect: %w", err)
-	}
-	t.links = append(t.links, kr)
 
 	// Raise maxactive: with the default, a burst of parallel accept()
 	// returns exhausts kretprobe instances and silently drops server
@@ -110,9 +143,10 @@ func NewTracer() (*Tracer, error) {
 			coll.Programs["atlas_inet_csk_accept_ret"], nil)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("attaching kretprobe inet_csk_accept: %w", err)
+		t.missing = append(t.missing, MissingAcceptAttribution)
+	} else {
+		t.links = append(t.links, kp)
 	}
-	t.links = append(t.links, kp)
 
 	rd, err := ringbuf.NewReader(coll.Maps["events"])
 	if err != nil {

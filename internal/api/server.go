@@ -27,6 +27,10 @@ type Meta struct {
 	DecodeErrors     uint64    `json:"decodeErrors"`
 	DockerEnrichment bool      `json:"dockerEnrichment"`
 	History          bool      `json:"history"`
+	// Degraded names capabilities this kernel could not provide (e.g.
+	// kprobes unavailable); empty on mainstream kernels. Degradation is
+	// announced, never silent.
+	Degraded []string `json:"degraded,omitempty"`
 	// HostPSI is the host pressure-stall snapshot (resources.HostPSI);
 	// absent on kernels without PSI.
 	HostPSI any `json:"hostPsi,omitempty"`

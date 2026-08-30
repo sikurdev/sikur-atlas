@@ -72,6 +72,12 @@ const (
 	KindTrafficStop   = "traffic-stop"
 	// Neutral lifecycle: recorded, never a primary.
 	KindExitClean = "exit-clean" // orderly exit(0): normal lifecycle
+	// KindExitStatus: a system-category process ended with a nonzero
+	// status but no signal. Infrastructure CLI tools (runc, networkctl,
+	// shims…) report errors through exit statuses as a matter of course;
+	// an infrastructure *service* dying involuntarily dies by signal,
+	// OOM or crash — which stay primary for every category.
+	KindExitStatus = "exit-status"
 	// Recovery.
 	KindFailuresEnd   = "failures-end"
 	KindTrafficResume = "traffic-resume"
@@ -277,6 +283,10 @@ type Input struct {
 	// nor refuted by local evidence. Dependency reachability never
 	// traverses through it (its members are unrelated endpoints).
 	ExternalID string
+	// SystemServices marks system-category services (host
+	// infrastructure): their non-signal status exits are neutral
+	// (see KindExitStatus).
+	SystemServices map[string]bool
 }
 
 // Investigate runs the rule set over one window of recorded evidence.
@@ -338,7 +348,7 @@ func Investigate(in Input) Report {
 		if !keep[ev.Service] {
 			continue
 		}
-		f, ok := lifecycleFinding(ev)
+		f, ok := lifecycleFinding(ev, in.SystemServices[ev.Service])
 		if !ok {
 			continue
 		}
@@ -662,7 +672,7 @@ func presenceGone(sp ServicePresence, last PresenceBucket, gapSecs int64) Findin
 }
 
 // lifecycleFinding maps one recorded lifecycle event to a finding.
-func lifecycleFinding(ev LifeEvent) (Finding, bool) {
+func lifecycleFinding(ev LifeEvent, system bool) (Finding, bool) {
 	var kind, detail string
 	switch ev.Kind {
 	case "oom":
@@ -674,6 +684,12 @@ func lifecycleFinding(ev LifeEvent) (Finding, bool) {
 			// exit(0) is normal lifecycle, recorded but never a primary:
 			// every short-lived client would otherwise read as an incident.
 			kind, detail = KindExitClean, "process exited cleanly"
+			break
+		}
+		if system && strings.HasPrefix(ev.Detail, "exited with status") {
+			// System tools erroring out via exit status are recorded but
+			// neutral (see KindExitStatus).
+			kind, detail = KindExitStatus, fmt.Sprintf("process exited: %s", ev.Detail)
 			break
 		}
 		kind, detail = KindExit, fmt.Sprintf("process exited: %s", ev.Detail)
@@ -965,7 +981,8 @@ func blastRadius(findings []Finding) BlastRadius {
 	edges := map[string]bool{}
 	for _, f := range findings {
 		switch f.Kind {
-		case KindFailuresEnd, KindTrafficResume, KindServiceBack, KindExec, KindExitClean:
+		case KindFailuresEnd, KindTrafficResume, KindServiceBack, KindExec,
+			KindExitClean, KindExitStatus:
 			continue
 		}
 		svc[f.Service] = true
@@ -1023,7 +1040,10 @@ func matchRecovery(findings []Finding) []Recovery {
 			detail = "presence resumed"
 		case KindOOM, KindOOMCgroup, KindCrash, KindExit:
 			subject = f.Service
-			idx = recoveredService(f.Service, f.End, KindExec)
+			// A restart lands within the same recorded second as the
+			// death routinely; recovery pairing (unlike origin ordering)
+			// accepts the tie.
+			idx = recoveredService(f.Service, f.Time, KindExec)
 			detail = "a process started again (restart)"
 		default:
 			continue

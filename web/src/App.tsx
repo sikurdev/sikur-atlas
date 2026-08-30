@@ -461,6 +461,11 @@ export function App({ makeSource }: { makeSource?: () => EventSource }) {
         {(meta?.decodeErrors ?? 0) > 0 && (
           <span className="warn">decode errors: {meta?.decodeErrors}</span>
         )}
+        {(meta?.degraded?.length ?? 0) > 0 && (
+          <span className="warn" title="This kernel cannot provide some attribution sources (kprobes unavailable); what is shown is still truthful, but narrower.">
+            degraded: {meta?.degraded?.join(", ")}
+          </span>
+        )}
       </footer>
     </div>
   );

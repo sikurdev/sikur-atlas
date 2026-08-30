@@ -182,8 +182,11 @@ The agent loads read-only BPF programs on stable tracepoints
 `tcp:tcp_receive_reset`, `sched:sched_process_exec`,
 `sched:sched_process_exit`, `oom:mark_victim`) and probes on
 `inet_csk_accept` and `unix_stream_connect` (kprobes — present on all
-mainstream distro kernels; a kernel built without `CONFIG_KPROBES`
-cannot run Atlas); it dumps the AF_UNIX socket table over netlink
+mainstream distro kernels; on a kernel built without `CONFIG_KPROBES`
+Atlas starts degraded, says so in the log, `/api/meta` and the UI
+footer, and loses server-side accept attribution and AF_UNIX connect
+counting while everything tracepoint- and scan-based keeps working); it
+dumps the AF_UNIX socket table over netlink
 `sock_diag` in each network namespace (via `setns`), reads the
 per-namespace TCP socket tables once at startup to seed pre-existing
 connections (and every 30 s to re-verify them), and reads `/proc` and

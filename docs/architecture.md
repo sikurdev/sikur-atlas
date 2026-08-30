@@ -411,7 +411,7 @@ Terminal primaries — something stopped existing or was killed:
 | `oom` | lifecycle event: the kernel OOM killer chose a process |
 | `oom-cgroup` | `memory.events oom_kill` delta, unless the lifecycle event for the same kill (same service, same bucket) is present |
 | `crash` | lifecycle event: fatal-signal death |
-| `exit` | lifecycle event: non-clean exit (signal or non-zero status). A clean `exit(0)` is recorded as neutral `exit-clean` — every short-lived tool would otherwise read as an incident |
+| `exit` | lifecycle event: an involuntary or erroring exit. A clean `exit(0)` is recorded as neutral `exit-clean` (every short-lived tool would otherwise read as an incident), and a *system-category* service's non-signal status exit is recorded as neutral `exit-status` (infrastructure CLIs — runc, shims, networkctl — signal errors via exit status routinely; an infrastructure service dying involuntarily dies by signal, OOM or crash, which stay primary for every category) |
 | `service-gone` | a service that had listening presence produces no presence rows for ≥ 90 s (three missed 30 s listen scans) |
 | `listen-lost` | presence continues but listening flips true → false |
 
@@ -460,7 +460,10 @@ what the Lens can say:
 Blast radius is observed impact — services and edges carrying
 non-chronic degradation findings — not reachability speculation.
 Recovery pairs each degradation with the recorded evidence of its end,
-or says "no recovery recorded within the window".
+or says "no recovery recorded within the window". Unlike origin
+ordering, recovery pairing accepts a same-second tie: a supervisor's
+restart exec routinely lands within the same recorded second as the
+death it answers.
 
 The UI's Lens panel renders the report next to the map: each finding
 jumps Replay to its moment, the origin can be focused (the same
@@ -552,6 +555,14 @@ straight from `/api/compare` output. There is no inference layer.
 
 - Ring buffer overflow drops events rather than blocking the kernel;
   drops are counted and surfaced in the UI footer.
+- A kernel that cannot attach kprobes (built without `CONFIG_KPROBES` —
+  some hardened or minimal VM kernels) starts Atlas degraded rather
+  than not at all: the tracepoint pipeline, startup seeding and the
+  socket-table scans all still work, while server-side accept
+  attribution (unidentified halves show as external, the documented
+  fallback) and AF_UNIX connect counting (standing pairs still come
+  from sock_diag) are lost. Degradation is announced in the log,
+  `/api/meta` (`degraded`) and the UI footer — never silent.
 - Pid attribution can miss a process that exits before `/proc` is read;
   the kernel-provided comm is kept as fallback identity.
 - Startup seeding closes the pre-existing-connection gap (see its

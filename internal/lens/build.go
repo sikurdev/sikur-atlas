@@ -42,9 +42,13 @@ func Run(st Store, from, to time.Time, service string, opts appview.Options) (Re
 	// with it the API traffic of clients talking to it — is excluded
 	// from the investigation.
 	excluded := map[string]bool{}
+	system := map[string]bool{}
 	for _, n := range view.Nodes {
 		if n.Category == appview.CategoryAtlas {
 			excluded[n.ID] = true
+		}
+		if n.Category == appview.CategorySystem {
+			system[n.ID] = true
 		}
 	}
 
@@ -61,7 +65,10 @@ func Run(st Store, from, to time.Time, service string, opts appview.Options) (Re
 		}
 	}
 
-	in := Input{From: from, To: to, Labels: labels, Service: service, ExternalID: appview.ExternalID}
+	in := Input{
+		From: from, To: to, Labels: labels, Service: service,
+		ExternalID: appview.ExternalID, SystemServices: system,
+	}
 
 	// Edge buckets, aggregated per service edge per bucket start.
 	rows, err := st.EdgeBucketsRange(from, to)

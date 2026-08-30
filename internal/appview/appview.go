@@ -94,7 +94,8 @@ var systemExes = map[string]bool{
 	"unattended-upgr": true, "php-agent": true, "provisioner": true,
 	"waagent": true, "python3-waagent": true, "google_guest_ag": true,
 	"amazon-ssm-agen": true, "walinuxagent": true, "Runner.Worker": true,
-	"Runner.Listener": true, "node-exporter": true,
+	"Runner.Listener": true, "hosted-compute-agent": true,
+	"node-exporter": true,
 }
 
 // Options tune the projection.
